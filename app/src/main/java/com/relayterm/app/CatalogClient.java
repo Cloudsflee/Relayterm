@@ -103,6 +103,9 @@ public final class CatalogClient {
                         .build();
                 try (Response response = http.newCall(request).execute()) {
                     String body = response.body() == null ? "" : response.body().string();
+                    if (response.code() == 410) {
+                        throw new IOException("配对码已过期或已使用，请在电脑端刷新配对二维码");
+                    }
                     if (!response.isSuccessful()) throw new IOException("配对失败 HTTP " + response.code());
                     JSONObject value = new JSONObject(body);
                     PairingResult result = new PairingResult(

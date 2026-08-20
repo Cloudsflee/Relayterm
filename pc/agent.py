@@ -320,6 +320,8 @@ class Agent:
         self.tunnel_url = ""
         self.pairing_url = ""
         self.qr_path: Path | None = None
+        self.pairing_dialog: tk.Toplevel | None = None
+        self._pairing_fetching = False
         self._status_fetching = False
         self.sessions: dict[str, dict[str, object]] = {}
         self.panel: tk.Toplevel | None = None
@@ -959,7 +961,9 @@ class Agent:
     def remote_access(self) -> None:
         if self.tunnel is not None and self.tunnel.running:
             if self.pairing_url:
-                self.show_pairing()
+                # Challenges are intentionally short-lived; reopening the action
+                # must replace an old QR instead of showing an expired one.
+                self._request_pairing(self.tunnel, self.tunnel_url)
             else:
                 self.stop_tunnel()
             return
@@ -995,16 +999,25 @@ class Agent:
             self.tunnel_url = detail
             self.remote_var.set(f"{glyph('remote')}  配对")
             self.tunnel_status_var.set("隧道已连接")
-            threading.Thread(target=self._create_pairing, args=(tunnel, detail), daemon=True).start()
+            self._request_pairing(tunnel, detail)
         elif state == "error":
             self.remote_var.set(f"{glyph('remote')}  远程访问")
             self.tunnel_status_var.set(f"隧道异常 ({detail})")
+            self._close_pairing_dialog()
             write_process_record(os.getpid(), self.bridge.pid if self.bridge else 0, 0)
         else:
             self.remote_var.set(f"{glyph('remote')}  远程访问")
             self.tunnel_status_var.set("隧道未启动")
+            self._close_pairing_dialog()
             self.tunnel_url = self.pairing_url = ""
             write_process_record(os.getpid(), self.bridge.pid if self.bridge else 0, 0)
+
+    def _request_pairing(self, tunnel: QuickTunnel, tunnel_url: str) -> None:
+        if not tunnel_url or self._pairing_fetching:
+            return
+        self._pairing_fetching = True
+        self.tunnel_status_var.set("配对码生成中")
+        threading.Thread(target=self._create_pairing, args=(tunnel, tunnel_url), daemon=True).start()
 
     def _create_pairing(self, tunnel: QuickTunnel, tunnel_url: str) -> None:
         try:
@@ -1019,6 +1032,7 @@ class Agent:
             image.save(path)
 
             def complete() -> None:
+                self._pairing_fetching = False
                 if tunnel is not self.tunnel or self.tunnel_url != tunnel_url:
                     try:
                         path.unlink()
@@ -1032,22 +1046,55 @@ class Agent:
                         previous.unlink()
                     except OSError:
                         pass
+                self.tunnel_status_var.set("隧道已连接")
+                self._close_pairing_dialog()
                 self.show_pairing()
 
             self.root.after(0, complete)
         except Exception as exc:
             message = f"配对码生成失败: {exc}"
-            self.root.after(0, lambda: (
-                self.tunnel_status_var.set(message) if tunnel is self.tunnel else None
-            ))
+            def failed() -> None:
+                self._pairing_fetching = False
+                if tunnel is self.tunnel:
+                    self.tunnel_status_var.set(message)
+            self.root.after(0, failed)
+
+    def _close_pairing_dialog(self) -> None:
+        dialog = self.pairing_dialog
+        self.pairing_dialog = None
+        if dialog is not None:
+            try:
+                if dialog.winfo_exists():
+                    dialog.destroy()
+            except tk.TclError:
+                pass
+
+    def refresh_pairing(self, dialog: tk.Toplevel | None = None) -> None:
+        if dialog is not None and dialog is not self.pairing_dialog:
+            return
+        tunnel = self.tunnel
+        if tunnel is None or not tunnel.running or not self.tunnel_url:
+            return
+        self._request_pairing(tunnel, self.tunnel_url)
 
     def show_pairing(self) -> None:
         if not self.pairing_url:
             return
+        self._close_pairing_dialog()
         dialog = tk.Toplevel(self.panel or self.root)
         dialog.title("RelayTerm 远程配对")
         dialog.transient(self.panel or self.root)
         dialog.resizable(False, False)
+        self.pairing_dialog = dialog
+        def close_dialog() -> None:
+            if self.pairing_dialog is dialog:
+                self._close_pairing_dialog()
+            else:
+                try:
+                    dialog.destroy()
+                except tk.TclError:
+                    pass
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
         frame = ttk.Frame(dialog, padding=(18, 16, 18, 14))
         frame.grid(row=0, column=0, sticky="nsew")
         dialog.columnconfigure(0, weight=1)
@@ -1066,6 +1113,9 @@ class Agent:
                 label.place(relx=0.5, rely=0.5, anchor="center", width=260, height=260)
             except Exception:
                 pass
+        ttk.Label(frame, text="二维码有效期 2 分钟，每次刷新后只能使用一次", style="Muted.TLabel").pack(
+            anchor="center", pady=(0, 2),
+        )
         actions = ttk.Frame(frame)
         actions.pack(fill="x", pady=(10, 0))
         actions.columnconfigure(0, weight=1)
@@ -1073,6 +1123,7 @@ class Agent:
         copy_actions.grid(row=0, column=0, sticky="w")
         ttk.Button(copy_actions, text="复制隧道地址", command=lambda: self.copy_text(self.tunnel_url)).pack(side="left")
         ttk.Button(copy_actions, text="复制配对页", command=lambda: self.copy_text(self.pairing_url)).pack(side="left", padx=(8, 0))
+        ttk.Button(copy_actions, text="刷新二维码", command=lambda: self.refresh_pairing(dialog)).pack(side="left", padx=(8, 0))
         ttk.Separator(actions, orient="vertical").grid(row=0, column=1, sticky="ns", padx=12)
         ttk.Button(actions, text="停止隧道", style="Danger.TButton", command=lambda: (dialog.destroy(), self.stop_tunnel())).grid(
             row=0, column=2, sticky="e",
@@ -1087,7 +1138,15 @@ class Agent:
         tunnel, self.tunnel = self.tunnel, None
         if tunnel is not None:
             tunnel.stop()
+        self._close_pairing_dialog()
         self.tunnel_url = self.pairing_url = ""
+        self._pairing_fetching = False
+        if self.qr_path is not None:
+            try:
+                self.qr_path.unlink()
+            except OSError:
+                pass
+            self.qr_path = None
         self.remote_var.set(f"{glyph('remote')}  远程访问")
         self.tunnel_status_var.set("隧道未启动")
         write_process_record(os.getpid(), self.bridge.pid if self.bridge else 0, 0)
