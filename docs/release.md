@@ -47,7 +47,8 @@ git push origin v0.1.1
 
 The workflow builds a signed APK, verifies its signature, creates
 `RelayTerm.apk` and `RelayTerm.apk.sha256`, and publishes both to the public
-repository's Release page. The stable download URL is:
+repository's Release page. Android `versionCode` is derived from the tag, so
+`v0.1.1` becomes `1001` and `v0.1.2` becomes `1002`. The stable download URL is:
 
 ```text
 https://github.com/Cloudsflee/Relayterm-releases/releases/latest/download/RelayTerm.apk

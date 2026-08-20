@@ -51,13 +51,24 @@ jobs:
           RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           VERSION_NAME="${GITHUB_REF_NAME#v}"
-          if [[ ! "$VERSION_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+          if [[ ! "$VERSION_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "Tag must contain a semantic version, for example v0.1.1"
+            exit 1
+          fi
+          CORE_VERSION="${VERSION_NAME%%-*}"
+          IFS=. read -r VERSION_MAJOR VERSION_MINOR VERSION_PATCH <<< "$CORE_VERSION"
+          if (( VERSION_MINOR > 999 || VERSION_PATCH > 999 )); then
+            echo "Minor and patch version components must be below 1000"
+            exit 1
+          fi
+          VERSION_CODE=$((10#$VERSION_MAJOR * 1000000 + 10#$VERSION_MINOR * 1000 + 10#$VERSION_PATCH))
+          if (( VERSION_CODE < 1 || VERSION_CODE > 2100000000 )); then
+            echo "Calculated Android versionCode is outside the supported range"
             exit 1
           fi
           ./gradlew --no-daemon clean assembleRelease \
             -PversionName="$VERSION_NAME" \
-            -PversionCode="$GITHUB_RUN_NUMBER"
+            -PversionCode="$VERSION_CODE"
 
       - name: Verify and prepare release assets
         id: assets
