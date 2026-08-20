@@ -61,6 +61,8 @@ python -m unittest pc.test_config -v
 APK 输出在 `app/build/outputs/apk/debug/app-debug.apk`。完整黑盒命令、基线哈希、修改产物、
 回滚和 patch 记录见 `docs/verification.md` 与 `artifacts/implementation.diff`。
 
+Android 正式版本发布、签名密钥和公开下载仓库配置见 `docs/release.md`。
+
 ## 回滚
 
 ```powershell

@@ -14,5 +14,6 @@ __pycache__/
 *.keystore
 *.p12
 *.pfx
+signing.properties
 .env
 .env.*

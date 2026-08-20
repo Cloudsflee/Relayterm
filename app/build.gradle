@@ -1,5 +1,25 @@
 apply plugin: "com.android.application"
 
+def releaseVersionCode = (findProperty("versionCode") ?: "1").toString().toInteger()
+def releaseVersionName = (findProperty("versionName") ?: "0.1.0").toString()
+def signingProperties = new Properties()
+def signingPropertiesFile = rootProject.file("signing.properties")
+if (signingPropertiesFile.isFile()) {
+    signingPropertiesFile.withInputStream { signingProperties.load(it) }
+}
+def signingValue = { String name ->
+    def environmentValue = System.getenv(name)
+    if (environmentValue != null && !environmentValue.trim().isEmpty()) return environmentValue.trim()
+    def fileValue = signingProperties.getProperty(name)
+    return fileValue == null ? "" : fileValue.trim()
+}
+def releaseStoreFile = signingValue("RELEASE_STORE_FILE")
+def releaseStorePassword = signingValue("RELEASE_STORE_PASSWORD")
+def releaseKeyAlias = signingValue("RELEASE_KEY_ALIAS")
+def releaseKeyPassword = signingValue("RELEASE_KEY_PASSWORD")
+def hasReleaseSigning = [releaseStoreFile, releaseStorePassword, releaseKeyAlias, releaseKeyPassword]
+        .every { value -> value != null && !value.toString().isEmpty() }
+
 android {
     namespace "com.relayterm.app"
     compileSdk 36
@@ -8,8 +28,8 @@ android {
         applicationId "com.relayterm.app"
         minSdk 26
         targetSdk 36
-        versionCode 1
-        versionName "0.1.0"
+        versionCode releaseVersionCode
+        versionName releaseVersionName
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -18,8 +38,20 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            release {
+                storeFile file(releaseStoreFile)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
+            if (hasReleaseSigning) signingConfig signingConfigs.release
             minifyEnabled false
             proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
         }

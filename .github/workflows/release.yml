@@ -1,0 +1,91 @@
+name: Build and publish Android release
+
+'on':
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_REPO: Cloudsflee/Relayterm-releases
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-36" "build-tools;36.1.0"
+
+      - name: Decode release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          test -n "$KEYSTORE_B64"
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/relayterm-release.jks"
+          test -s "$RUNNER_TEMP/relayterm-release.jks"
+
+      - name: Build signed APK
+        env:
+          RELEASE_STORE_FILE: ${{ runner.temp }}/relayterm-release.jks
+          RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          VERSION_NAME="${GITHUB_REF_NAME#v}"
+          if [[ ! "$VERSION_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Tag must contain a semantic version, for example v0.1.1"
+            exit 1
+          fi
+          ./gradlew --no-daemon clean assembleRelease \
+            -PversionName="$VERSION_NAME" \
+            -PversionCode="$GITHUB_RUN_NUMBER"
+
+      - name: Verify and prepare release assets
+        id: assets
+        run: |
+          APK="app/build/outputs/apk/release/app-release.apk"
+          test -s "$APK"
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)
+          test -x "$APKSIGNER"
+          "$APKSIGNER" verify --verbose "$APK"
+          cp "$APK" "$RUNNER_TEMP/RelayTerm.apk"
+          sha256sum "$RUNNER_TEMP/RelayTerm.apk" \
+            | awk '{print $1 "  RelayTerm.apk"}' > "$RUNNER_TEMP/RelayTerm.apk.sha256"
+          printf 'version=%s\n' "${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          test -n "$GH_TOKEN"
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          RelayTerm ${GITHUB_REF_NAME#v}
+
+          Install `RelayTerm.apk` on Android. SHA-256 is included in `RelayTerm.apk.sha256`.
+          Source commit: ${GITHUB_SHA}
+          EOF
+          gh release create "$GITHUB_REF_NAME" \
+            "$RUNNER_TEMP/RelayTerm.apk#RelayTerm.apk" \
+            "$RUNNER_TEMP/RelayTerm.apk.sha256#RelayTerm.apk.sha256" \
+            --repo "$RELEASE_REPO" \
+            --title "RelayTerm ${GITHUB_REF_NAME#v}" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
