@@ -1,0 +1,7 @@
+tunnel: relayterm
+credentials-file: C:\path\to\credentials.json
+
+ingress:
+  - hostname: relay.example.com
+    service: http://127.0.0.1:18765
+  - service: http_status:404
