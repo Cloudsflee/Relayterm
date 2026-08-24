@@ -88,12 +88,12 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
         run: |
           test -n "$GH_TOKEN"
-          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
-          RelayTerm ${GITHUB_REF_NAME#v}
-
-          Install `RelayTerm.apk` on Android. SHA-256 is included in `RelayTerm.apk.sha256`.
-          Source commit: ${GITHUB_SHA}
-          EOF
+          {
+            echo "RelayTerm ${GITHUB_REF_NAME#v}"
+            echo
+            echo 'Install `RelayTerm.apk` on Android. SHA-256 is included in `RelayTerm.apk.sha256`.'
+            echo "Source commit: ${GITHUB_SHA}"
+          } > "$RUNNER_TEMP/release-notes.md"
           gh release create "$GITHUB_REF_NAME" \
             "$RUNNER_TEMP/RelayTerm.apk#RelayTerm.apk" \
             "$RUNNER_TEMP/RelayTerm.apk.sha256#RelayTerm.apk.sha256" \
