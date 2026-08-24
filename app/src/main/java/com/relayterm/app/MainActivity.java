@@ -4,9 +4,11 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.StateListDrawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
@@ -17,6 +19,7 @@ import android.view.KeyEvent;
 import android.view.View;
 import android.view.Window;
 import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
@@ -29,6 +32,11 @@ import android.widget.Space;
 import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsAnimationCompat;
+import androidx.core.view.WindowInsetsCompat;
 
 import com.google.zxing.client.android.Intents;
 import com.journeyapps.barcodescanner.CaptureActivity;
@@ -67,6 +75,7 @@ public final class MainActivity extends Activity {
     private final Set<String> requestedProfiles = new HashSet<>();
     private final Set<String> readyProfiles = new HashSet<>();
     private final Set<String> endedProfiles = new HashSet<>();
+    private final Set<String> pendingReplayProfiles = new HashSet<>();
     private final Map<String, String> profileErrors = new HashMap<>();
     private final Map<String, String> profileRoles = new HashMap<>();
     private final Map<String, JSONObject> catalogSessions = new HashMap<>();
@@ -84,14 +93,19 @@ public final class MainActivity extends Activity {
     private String activePtyProfileId = "";
     private String activeLocalProfileId = "";
     private boolean foreground;
-    private boolean stopArmed;
-    private Runnable pendingForceStop;
+    private final StopFlow stopFlow = new StopFlow();
+    private AlertDialog stopDialog;
+    private int baseRootLeft;
+    private int baseRootTop;
+    private int baseRootRight;
+    private int baseRootBottom;
 
     private final PtyClient.Listener ptyListener = new PtyClient.Listener() {
         @Override
         public void onConnecting(String profileId, int attempt) {
             readyProfiles.remove(profileId);
             if (isSelected(profileId)) {
+                resetStopFlow();
                 connectButton.setEnabled(false);
                 setStatus(attempt == 1 ? "连接中…" : "重连中（" + attempt + "）…", SECONDARY);
             }
@@ -104,13 +118,15 @@ public final class MainActivity extends Activity {
             profileErrors.remove(profileId);
             requestedProfiles.add(profileId);
             profileRoles.put(profileId, role);
-            stopArmed = false;
+            if (resumed) pendingReplayProfiles.add(profileId);
+            else pendingReplayProfiles.remove(profileId);
+            resetStopFlow();
             if (isSelected(profileId)) {
                 connectButton.setEnabled(true);
                 connectButton.setText("重连");
                 sendButton.setEnabled(true);
                 stopButton.setEnabled(true);
-                stopButton.setText("停止");
+                updateStopButtonStyle(false);
                 String label = "controller".equals(role) ? "控制端" : "观察端";
                 setStatus(resumed ? label + " · 已恢复" : label + " · 运行中", ACCENT);
             }
@@ -119,6 +135,13 @@ public final class MainActivity extends Activity {
         @Override
         public void onOutput(String profileId, byte[] bytes) {
             AnsiTerminalModel model = terminalFor(profileId);
+            if (pendingReplayProfiles.remove(profileId)) {
+                // The bridge sends a resumed snapshot before live output. Swap
+                // it in one callback so reconnect/rotation never shows a
+                // transient blank grid or duplicates the snapshot.
+                model.reset();
+                model.resize(terminalView.getTerminalColumns(), terminalView.getTerminalRows());
+            }
             model.feed(bytes);
             if (isSelected(profileId)) {
                 terminalView.scrollToBottom();
@@ -130,6 +153,7 @@ public final class MainActivity extends Activity {
         public void onEvent(String profileId, JSONObject event) {
             String type = event.optString("type", "");
             if ("resync_required".equals(type)) {
+                pendingReplayProfiles.remove(profileId);
                 terminalFor(profileId).reset();
                 if (isSelected(profileId)) setStatus("需要重新同步", WARNING);
             } else if ("control_changed".equals(type)) {
@@ -146,8 +170,8 @@ public final class MainActivity extends Activity {
         public void onExit(String profileId, int code, String cwd) {
             readyProfiles.remove(profileId);
             endedProfiles.add(profileId);
-            stopArmed = false;
-            cancelPendingForceStop();
+            pendingReplayProfiles.remove(profileId);
+            resetStopFlow();
             appendSystem(profileId, "进程已退出（" + code + "）"
                     + (cwd.isEmpty() ? "" : " · " + cwd) + "\r\n");
             if (isSelected(profileId)) {
@@ -155,7 +179,7 @@ public final class MainActivity extends Activity {
                 connectButton.setText("新建");
                 sendButton.setEnabled(false);
                 stopButton.setEnabled(false);
-                stopButton.setText("停止");
+                updateStopButtonStyle(false);
                 setStatus("已退出 · " + code, code == 0 ? SECONDARY : DANGER);
             }
         }
@@ -163,7 +187,8 @@ public final class MainActivity extends Activity {
         @Override
         public void onDisconnected(String profileId, boolean reconnecting) {
             readyProfiles.remove(profileId);
-            if (reconnecting) terminalFor(profileId).reset();
+            if (isSelected(profileId)) resetStopFlow();
+            if (!reconnecting) pendingReplayProfiles.remove(profileId);
             if (isSelected(profileId) && reconnecting) {
                 connectButton.setEnabled(true);
                 setStatus("重连中…", SECONDARY);
@@ -174,6 +199,7 @@ public final class MainActivity extends Activity {
         public void onError(String profileId, String message) {
             profileErrors.put(profileId, message);
             if (isSelected(profileId)) {
+                resetStopFlow();
                 connectButton.setEnabled(true);
                 setStatus(message == null || message.isEmpty() ? "连接错误" : message, DANGER);
             }
@@ -208,14 +234,61 @@ public final class MainActivity extends Activity {
     private View buildScreen() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(12), dp(6), dp(12), dp(8));
+        baseRootLeft = dp(12);
+        baseRootTop = dp(6);
+        baseRootRight = dp(12);
+        baseRootBottom = dp(8);
+        root.setPadding(baseRootLeft, baseRootTop, baseRootRight, baseRootBottom);
         root.setBackgroundColor(BG);
-        root.setOnApplyWindowInsetsListener((view, insets) -> {
-            int top = insets.getSystemWindowInsetTop();
-            int bottom = insets.getSystemWindowInsetBottom();
-            view.setPadding(dp(12), dp(6) + top, dp(12), dp(8) + bottom);
+        ViewCompat.setOnApplyWindowInsetsListener(root, (view, insets) -> {
+            Insets bars = insets.getInsets(WindowInsetsCompat.Type.systemBars());
+            Insets ime = insets.getInsets(WindowInsetsCompat.Type.ime());
+            // ADJUST_RESIZE already changes the root's measured height. Use
+            // the larger bottom inset once instead of adding nav + IME.
+            int bottom = Math.max(bars.bottom, ime.bottom);
+            int left = Math.max(0, bars.left);
+            int right = Math.max(0, bars.right);
+            int top = Math.max(0, bars.top);
+            int nextLeft = baseRootLeft + left;
+            int nextTop = baseRootTop + top;
+            int nextRight = baseRootRight + right;
+            int nextBottom = baseRootBottom + bottom;
+            if (view.getPaddingLeft() != nextLeft || view.getPaddingTop() != nextTop
+                    || view.getPaddingRight() != nextRight || view.getPaddingBottom() != nextBottom) {
+                view.setPadding(nextLeft, nextTop, nextRight, nextBottom);
+            }
             return insets;
         });
+        ViewCompat.setWindowInsetsAnimationCallback(root,
+                new WindowInsetsAnimationCompat.Callback(
+                        WindowInsetsAnimationCompat.Callback.DISPATCH_MODE_CONTINUE_ON_SUBTREE) {
+                    private int imeAnimations;
+
+                    @Override
+                    public void onPrepare(WindowInsetsAnimationCompat animation) {
+                        if ((animation.getTypeMask() & WindowInsetsCompat.Type.ime()) != 0) {
+                            imeAnimations++;
+                            if (terminalView != null) terminalView.setResizeSuspended(true);
+                        }
+                    }
+
+                    @Override
+                    public WindowInsetsCompat onProgress(WindowInsetsCompat insets,
+                            List<WindowInsetsAnimationCompat> runningAnimations) {
+                        return insets;
+                    }
+
+                    @Override
+                    public void onEnd(WindowInsetsAnimationCompat animation) {
+                        if ((animation.getTypeMask() & WindowInsetsCompat.Type.ime()) != 0) {
+                            imeAnimations = Math.max(0, imeAnimations - 1);
+                            if (imeAnimations == 0 && terminalView != null) {
+                                terminalView.setResizeSuspended(false);
+                            }
+                        }
+                    }
+                });
+        ViewCompat.requestApplyInsets(root);
 
         FrameLayout header = new FrameLayout(this);
         header.setLayoutParams(new LinearLayout.LayoutParams(-1, dp(54)));
@@ -242,7 +315,7 @@ public final class MainActivity extends Activity {
 
         LinearLayout switchRow = row();
         profileSpinner = new Spinner(this);
-        profileSpinner.setBackground(panelBackground(RAISED, OUTLINE, 6));
+        profileSpinner.setBackground(buttonBackground(6));
         switchRow.addView(profileSpinner, new LinearLayout.LayoutParams(0, dp(46), 1));
         ImageButton edit = iconButton(android.R.drawable.ic_menu_edit, "编辑终端");
         edit.setOnClickListener(v -> { if (!profiles.isEmpty()) showEditor(profiles.get(selectedIndex)); });
@@ -272,6 +345,11 @@ public final class MainActivity extends Activity {
                 "远端使用 HTTPS，token 由系统密钥库保护");
         securityInfo.setTooltipText("远端使用 HTTPS，token 由系统密钥库保护");
         statusRow.addView(securityInfo, new LinearLayout.LayoutParams(dp(40), dp(25)));
+        ImageButton keyboard = iconButton(android.R.drawable.ic_menu_edit, "打开输入法");
+        keyboard.setOnClickListener(v -> showTerminalInputMethod());
+        LinearLayout.LayoutParams keyboardParams = new LinearLayout.LayoutParams(dp(40), dp(25));
+        keyboardParams.setMarginStart(dp(4));
+        statusRow.addView(keyboard, keyboardParams);
         root.addView(statusRow);
 
         FrameLayout terminalFrame = new FrameLayout(this);
@@ -300,7 +378,7 @@ public final class MainActivity extends Activity {
         commandInput.setPadding(dp(10), 0, dp(10), 0);
         commandInput.setInputType(InputType.TYPE_CLASS_TEXT
                 | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-                | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+                | InputType.TYPE_TEXT_VARIATION_NORMAL);
         commandInput.setImeOptions(EditorInfo.IME_ACTION_SEND);
         commandInput.setOnEditorActionListener((v, action, event) -> {
             boolean enter = event != null && event.getKeyCode() == KeyEvent.KEYCODE_ENTER
@@ -319,10 +397,10 @@ public final class MainActivity extends Activity {
         sendParams.setMarginStart(dp(6));
         commandRow.addView(sendButton, sendParams);
         stopButton = actionButton("停止", android.R.drawable.ic_media_pause);
-        stopButton.setTextColor(DANGER);
+        updateStopButtonStyle(false);
         stopButton.setEnabled(false);
         stopButton.setOnClickListener(v -> stopCurrent());
-        LinearLayout.LayoutParams stopParams = new LinearLayout.LayoutParams(dp(78), dp(48));
+        LinearLayout.LayoutParams stopParams = new LinearLayout.LayoutParams(dp(108), dp(48));
         stopParams.setMarginStart(dp(6));
         commandRow.addView(stopButton, stopParams);
         root.addView(commandRow, new LinearLayout.LayoutParams(-1, dp(54)));
@@ -418,12 +496,11 @@ public final class MainActivity extends Activity {
         selectedIndex = Math.max(0, Math.min(index, profiles.size() - 1));
         TerminalProfile selected = profiles.get(selectedIndex);
         if (!selected.id.equals(store.selectedId())) {
-            cancelPendingForceStop();
-            stopArmed = false;
-            if (stopButton != null) stopButton.setText("停止");
+            resetStopFlow();
         }
         store.setSelectedId(selected.id);
         if (!activePtyProfileId.isEmpty() && !activePtyProfileId.equals(selected.id)) {
+            resetStopFlow();
             ptyClient.disconnect();
             activePtyProfileId = "";
         }
@@ -447,6 +524,7 @@ public final class MainActivity extends Activity {
             connectButton.setText(ready ? "就绪" : "连接");
             sendButton.setEnabled(ready && !localRunner.isRunning());
             stopButton.setEnabled(localRunner.isRunning());
+            updateStopButtonStyle(stopFlow.isArmed());
             setStatus(ready ? "本机就绪" : "未连接", ready ? ACCENT : SECONDARY);
             return;
         }
@@ -454,11 +532,13 @@ public final class MainActivity extends Activity {
             connectButton.setText("新建");
             sendButton.setEnabled(false);
             stopButton.setEnabled(false);
+            updateStopButtonStyle(false);
             setStatus("已退出", SECONDARY);
         } else if (readyProfiles.contains(profile.id) && profile.id.equals(activePtyProfileId)) {
             connectButton.setText("重连");
             sendButton.setEnabled(true);
             stopButton.setEnabled(true);
+            updateStopButtonStyle(stopFlow.isArmed());
             String role = profileRoles.getOrDefault(profile.id, "observer");
             setStatus("controller".equals(role) ? "控制端 · 运行中" : "观察端 · 运行中",
                     "controller".equals(role) ? ACCENT : SECONDARY);
@@ -466,11 +546,13 @@ public final class MainActivity extends Activity {
             connectButton.setText("重连");
             sendButton.setEnabled(false);
             stopButton.setEnabled(false);
+            updateStopButtonStyle(false);
             setStatus(profileErrors.get(profile.id), DANGER);
         } else {
             connectButton.setText(requestedProfiles.contains(profile.id) ? "重连" : "连接");
             sendButton.setEnabled(false);
             stopButton.setEnabled(false);
+            updateStopButtonStyle(false);
             JSONObject session = catalogSessions.get(profile.id);
             if (session != null && session.optBoolean("running", false)) {
                 setStatus("运行中 · 未连接", SECONDARY);
@@ -502,12 +584,16 @@ public final class MainActivity extends Activity {
             return;
         }
         boolean createFresh = endedProfiles.remove(profile.id);
-        if (createFresh && activePtyProfileId.equals(profile.id)) ptyClient.closeSession(true);
+        if (createFresh && activePtyProfileId.equals(profile.id)) {
+            resetStopFlow();
+            ptyClient.closeSession(true);
+        }
         openPty(profile, !createFresh);
     }
 
     private void openPty(TerminalProfile profile, boolean resume) {
         if (!foreground && !isChangingConfigurations()) return;
+        resetStopFlow();
         if (!activePtyProfileId.isEmpty() && !activePtyProfileId.equals(profile.id)) ptyClient.disconnect();
         activePtyProfileId = profile.id;
         ptyClient.connect(profile, terminalView.getTerminalColumns(), terminalView.getTerminalRows(),
@@ -539,12 +625,26 @@ public final class MainActivity extends Activity {
         terminalView.scrollToBottom();
     }
 
+    private void showTerminalInputMethod() {
+        if (terminalView == null) return;
+        terminalView.requestFocus();
+        terminalView.post(() -> {
+            InputMethodManager manager = (InputMethodManager)
+                    getSystemService(INPUT_METHOD_SERVICE);
+            if (manager != null) {
+                manager.restartInput(terminalView);
+                manager.showSoftInput(terminalView, InputMethodManager.SHOW_IMPLICIT);
+            }
+        });
+    }
+
     private void runLocal(TerminalProfile profile, String command) {
         if (!readyProfiles.contains(profile.id)) {
             toast("请先连接终端");
             return;
         }
         appendRaw(profile.id, ("$ " + command + "\r\n").getBytes(StandardCharsets.UTF_8));
+        resetStopFlow();
         sendButton.setEnabled(false);
         stopButton.setEnabled(true);
         activeLocalProfileId = profile.id;
@@ -559,11 +659,13 @@ public final class MainActivity extends Activity {
                         ("[stderr] " + result.stderr + "\r\n").getBytes(StandardCharsets.UTF_8));
                 appendSystem(profile.id, "exit " + result.exitCode + "\r\n");
                 activeLocalProfileId = "";
+                resetStopFlow();
                 if (isSelected(profile.id)) updateSelectedState();
             }
             @Override public void onError(String message) {
                 appendSystem(profile.id, "error: " + message + "\r\n");
                 activeLocalProfileId = "";
+                resetStopFlow();
                 if (isSelected(profile.id)) setStatus("执行失败", DANGER);
             }
         });
@@ -600,44 +702,113 @@ public final class MainActivity extends Activity {
     private void stopCurrent() {
         if (profiles.isEmpty()) return;
         TerminalProfile profile = profiles.get(selectedIndex);
+        boolean active = profile.isLocal()
+                ? localRunner.isRunning() && profile.id.equals(activeLocalProfileId)
+                : profile.id.equals(activePtyProfileId) && ptyClient.isConnected();
+        StopFlow.Action action = stopFlow.click(active);
+        if (action == StopFlow.Action.SHOW_STOP_CONFIRMATION) {
+            showStopConfirmation(false, profile);
+        } else if (action == StopFlow.Action.SHOW_FORCE_CONFIRMATION) {
+            showStopConfirmation(true, profile);
+        }
+    }
+
+    private void confirmStop(TerminalProfile profile) {
+        StopFlow.Action action = stopFlow.confirmStop();
+        if (action != StopFlow.Action.SEND_INTERRUPT) return;
         if (profile.isLocal()) {
             localRunner.cancel();
             activeLocalProfileId = "";
             appendSystem(profile.id, "已请求停止\r\n");
+            resetStopFlow();
             updateSelectedState();
             return;
         }
-        if (!profile.id.equals(activePtyProfileId) || !ptyClient.isConnected()) return;
-        if (stopArmed) {
-            forceTerminate(profile.id);
+        if (!profile.id.equals(activePtyProfileId) || !ptyClient.isConnected()) {
+            resetStopFlow();
+            updateSelectedState();
             return;
         }
-        stopArmed = true;
         ptyClient.signal("INT");
-        stopButton.setText("终止");
+        updateStopButtonStyle(true);
         setStatus("已发送 Ctrl-C", WARNING);
-        pendingForceStop = () -> {
-            if (stopArmed && profile.id.equals(activePtyProfileId) && ptyClient.isConnected()) {
-                forceTerminate(profile.id);
-            }
-        };
-        main.postDelayed(pendingForceStop, 2000);
     }
 
     private void forceTerminate(String profileId) {
-        cancelPendingForceStop();
-        stopArmed = false;
+        stopFlow.confirmForce();
         ptyClient.closeSession(true);
         readyProfiles.remove(profileId);
         endedProfiles.add(profileId);
         requestedProfiles.remove(profileId);
+        pendingReplayProfiles.remove(profileId);
         appendSystem(profileId, "会话已强制终止\r\n");
+        resetStopFlow();
         if (isSelected(profileId)) updateSelectedState();
     }
 
-    private void cancelPendingForceStop() {
-        if (pendingForceStop != null) main.removeCallbacks(pendingForceStop);
-        pendingForceStop = null;
+    private void confirmForce(TerminalProfile profile) {
+        if (!profile.isLocal() && profile.id.equals(activePtyProfileId)
+                && ptyClient.isConnected()) forceTerminate(profile.id);
+        else resetStopFlow();
+    }
+
+    private void showStopConfirmation(boolean force, TerminalProfile profile) {
+        if (stopDialog != null && stopDialog.isShowing()) stopDialog.dismiss();
+        String title = force ? "强制终止会话？" : "停止当前会话？";
+        String message = force
+                ? "这会立即关闭远程会话并丢失未保存状态。"
+                : (profile.isLocal() ? "确认取消当前本机命令？" : "先向远程终端发送 Ctrl-C？");
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setMessage(message)
+                .setNegativeButton("取消", null)
+                .setPositiveButton(force ? "强制终止" : "停止", null)
+                .create();
+        stopDialog = dialog;
+        dialog.setOnShowListener(ignored -> {
+            styleDialog(dialog, force);
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+                stopDialog = null;
+                dialog.dismiss();
+                if (force) confirmForce(profile);
+                else confirmStop(profile);
+            });
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(view -> {
+                stopDialog = null;
+                dialog.dismiss();
+                stopFlow.cancelConfirmation();
+                updateStopButtonStyle(stopFlow.isArmed());
+            });
+        });
+        dialog.setOnCancelListener(ignored -> {
+            if (stopDialog == dialog) stopDialog = null;
+            stopFlow.cancelConfirmation();
+            updateStopButtonStyle(stopFlow.isArmed());
+        });
+        dialog.show();
+    }
+
+    private void resetStopFlow() {
+        AlertDialog dialog = stopDialog;
+        stopDialog = null;
+        if (dialog != null && dialog.isShowing()) dialog.dismiss();
+        stopFlow.reset();
+        if (stopButton != null) updateStopButtonStyle(false);
+    }
+
+    private void updateStopButtonStyle(boolean force) {
+        if (stopButton == null) return;
+        stopButton.setText(force ? "强制终止" : "停止");
+        stopButton.setTextSize(force ? 11 : 12);
+        stopButton.setCompoundDrawablesWithIntrinsicBounds(
+                force ? android.R.drawable.ic_menu_close_clear_cancel
+                        : android.R.drawable.ic_media_pause,
+                0, 0, 0);
+        stopButton.setCompoundDrawablePadding(dp(3));
+        int activeColor = force ? DANGER : WARNING;
+        stopButton.setTextColor(new ColorStateList(
+                new int[][]{{-android.R.attr.state_enabled}, {android.R.attr.state_pressed}, {}},
+                new int[]{SECONDARY, activeColor, activeColor}));
     }
 
     private void clearTerminal() {
@@ -696,8 +867,10 @@ public final class MainActivity extends Activity {
                 .setPositiveButton("保存", null)
                 .create();
         dialog.setOnShowListener(d -> {
+            styleDialog(dialog, false);
             if (!creating) {
                 dialog.setButton(AlertDialog.BUTTON_NEUTRAL, "删除", (view, which) -> confirmDelete(existing));
+                dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setTextColor(WARNING);
             }
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
                 String nameValue = name.getText().toString().trim();
@@ -715,6 +888,7 @@ public final class MainActivity extends Activity {
                 TerminalProfile saved = new TerminalProfile(id, nameValue, endpointValue,
                         token.getText().toString(), startupValue, cwd.getText().toString());
                 if (!creating && id.equals(activePtyProfileId)) {
+                    resetStopFlow();
                     ptyClient.disconnect();
                     activePtyProfileId = "";
                     readyProfiles.remove(id);
@@ -731,19 +905,21 @@ public final class MainActivity extends Activity {
     private void showManagedProfile(TerminalProfile profile) {
         String detail = profile.workingDirectory + "\n"
                 + profile.shell + (profile.startupCommand.isEmpty() ? "" : " · " + profile.startupCommand);
-        new AlertDialog.Builder(this)
+        AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle(profile.name)
                 .setMessage(detail)
                 .setPositiveButton("关闭", null)
-                .show();
+                .create();
+        dialog.setOnShowListener(ignored -> styleDialog(dialog, false));
+        dialog.show();
     }
 
     private void confirmDelete(TerminalProfile profile) {
-        new AlertDialog.Builder(this)
+        AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("删除终端？")
                 .setMessage(profile.name)
                 .setNegativeButton("取消", null)
-                .setPositiveButton("删除", (dialog, which) -> {
+                .setPositiveButton("删除", (ignored, which) -> {
                     Set<String> removed = new HashSet<>();
                     removed.add(profile.id);
                     for (TerminalProfile item : profiles) {
@@ -752,10 +928,12 @@ public final class MainActivity extends Activity {
                         }
                     }
                     if (removed.contains(activePtyProfileId)) {
+                        resetStopFlow();
                         ptyClient.closeSession(true);
                         activePtyProfileId = "";
                     }
                     if (removed.contains(activeLocalProfileId)) {
+                        resetStopFlow();
                         localRunner.cancel();
                         activeLocalProfileId = "";
                     }
@@ -766,11 +944,14 @@ public final class MainActivity extends Activity {
                         requestedProfiles.remove(id);
                         readyProfiles.remove(id);
                         endedProfiles.remove(id);
+                        pendingReplayProfiles.remove(id);
                         profileErrors.remove(id);
                         profileRoles.remove(id);
                     }
                     reloadProfiles("");
-                }).show();
+                }).create();
+        dialog.setOnShowListener(ignored -> styleDialog(dialog, true));
+        dialog.show();
     }
 
     private void reloadProfiles(String selectedId) {
@@ -832,6 +1013,7 @@ public final class MainActivity extends Activity {
                         requestedProfiles.remove(removed);
                         readyProfiles.remove(removed);
                         endedProfiles.remove(removed);
+                        pendingReplayProfiles.remove(removed);
                         profileErrors.remove(removed);
                         profileRoles.remove(removed);
                     }
@@ -953,8 +1135,35 @@ public final class MainActivity extends Activity {
             button.setCompoundDrawablePadding(dp(3));
             button.setCompoundDrawablesWithIntrinsicBounds(icon, 0, 0, 0);
         }
-        button.setBackground(panelBackground(RAISED, OUTLINE, 5));
+        button.setTextColor(new ColorStateList(
+                new int[][]{{-android.R.attr.state_enabled}, {android.R.attr.state_pressed}, {}},
+                new int[]{SECONDARY, PRIMARY, PRIMARY}));
+        button.setBackground(buttonBackground(5));
         return button;
+    }
+
+    private StateListDrawable buttonBackground(int radius) {
+        StateListDrawable states = new StateListDrawable();
+        states.addState(new int[]{-android.R.attr.state_enabled},
+                panelBackground(SURFACE, OUTLINE, radius));
+        states.addState(new int[]{android.R.attr.state_pressed},
+                panelBackground(Color.rgb(31, 54, 59), ACCENT, radius));
+        states.addState(new int[]{}, panelBackground(RAISED, OUTLINE, radius));
+        return states;
+    }
+
+    private void styleDialog(AlertDialog dialog, boolean danger) {
+        if (dialog == null) return;
+        Window window = dialog.getWindow();
+        if (window != null) window.setBackgroundDrawable(panelBackground(SURFACE, OUTLINE, 8));
+        TextView message = dialog.findViewById(android.R.id.message);
+        if (message != null) message.setTextColor(SECONDARY);
+        Button positive = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+        Button negative = dialog.getButton(AlertDialog.BUTTON_NEGATIVE);
+        Button neutral = dialog.getButton(AlertDialog.BUTTON_NEUTRAL);
+        if (positive != null) positive.setTextColor(danger ? DANGER : ACCENT);
+        if (negative != null) negative.setTextColor(SECONDARY);
+        if (neutral != null) neutral.setTextColor(WARNING);
     }
 
     private ImageButton iconButton(int icon, String description) {
@@ -963,7 +1172,7 @@ public final class MainActivity extends Activity {
         button.setContentDescription(description);
         button.setTooltipText(description);
         button.setColorFilter(ACCENT);
-        button.setBackground(panelBackground(RAISED, OUTLINE, 5));
+        button.setBackground(buttonBackground(5));
         return button;
     }
 
@@ -1043,8 +1252,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onPause() {
         foreground = false;
-        cancelPendingForceStop();
-        stopArmed = false;
+        resetStopFlow();
         if (ptyClient.isConnected() || !activePtyProfileId.isEmpty()) ptyClient.disconnect();
         activePtyProfileId = "";
         super.onPause();
@@ -1061,7 +1269,7 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        cancelPendingForceStop();
+        resetStopFlow();
         ptyClient.shutdown();
         catalogClient.shutdown();
         localRunner.shutdown();

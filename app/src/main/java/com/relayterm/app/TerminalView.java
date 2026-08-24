@@ -5,12 +5,18 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Typeface;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.InputType;
 import android.util.AttributeSet;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.inputmethod.BaseInputConnection;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputConnection;
+import android.view.inputmethod.InputMethodManager;
 
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 /** Canvas renderer for {@link AnsiTerminalModel}; no WebView or nested scrolling. */
@@ -26,6 +32,7 @@ public final class TerminalView extends View {
 
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
     private final Paint backgroundPaint = new Paint();
+    private final Handler main = new Handler(Looper.getMainLooper());
     private AnsiTerminalModel model = new AnsiTerminalModel();
     private Listener listener;
     private float cellWidth;
@@ -34,6 +41,11 @@ public final class TerminalView extends View {
     private int lastColumns = 100;
     private int lastRows = 32;
     private int scrollOffset;
+    private boolean resizeSuspended;
+    private int pendingColumns = -1;
+    private int pendingRows = -1;
+    private final Runnable resizeCommit = this::commitPendingResize;
+    private final TerminalInputCodec.Composer composer = new TerminalInputCodec.Composer();
 
     public TerminalView(Context context) {
         this(context, null);
@@ -56,6 +68,7 @@ public final class TerminalView extends View {
 
     public void setModel(AnsiTerminalModel model) {
         this.model = model == null ? new AnsiTerminalModel(lastColumns, lastRows) : model;
+        composer.clear();
         this.scrollOffset = 0;
         this.model.resize(lastColumns, lastRows);
         invalidate();
@@ -79,6 +92,7 @@ public final class TerminalView extends View {
     }
 
     public void clearTerminal() {
+        composer.clear();
         model.reset();
         model.resize(lastColumns, lastRows);
         scrollOffset = 0;
@@ -101,6 +115,56 @@ public final class TerminalView extends View {
         invalidate();
     }
 
+    /**
+     * Hold grid/PTTY resize notifications while the IME changes the window
+     * height. The final dimensions are committed together when animation
+     * ends, preventing a stream of intermediate resize events.
+     */
+    public void setResizeSuspended(boolean suspended) {
+        resizeSuspended = suspended;
+        if (suspended) {
+            main.removeCallbacks(resizeCommit);
+        } else {
+            main.removeCallbacks(resizeCommit);
+            commitPendingResize();
+        }
+    }
+
+    public boolean isResizeSuspended() {
+        return resizeSuspended;
+    }
+
+    /** Visible for diagnostics/tests; this text has not been sent to the PTY. */
+    public String getComposingText() {
+        return composer.value();
+    }
+
+    /** Apply a measured size immediately, useful after an inset animation. */
+    public void commitResize() {
+        main.removeCallbacks(resizeCommit);
+        commitPendingResize();
+    }
+
+    private void scheduleResizeCommit() {
+        main.removeCallbacks(resizeCommit);
+        // A short debounce also covers pre-Android-30 devices where the
+        // compat animation callback may not expose every IME transition.
+        main.postDelayed(resizeCommit, 150L);
+    }
+
+    private void commitPendingResize() {
+        if (resizeSuspended || pendingColumns < 2 || pendingRows < 2) return;
+        int columns = pendingColumns;
+        int rows = pendingRows;
+        pendingColumns = pendingRows = -1;
+        if (columns == lastColumns && rows == lastRows) return;
+        lastColumns = columns;
+        lastRows = rows;
+        model.resize(columns, rows);
+        if (listener != null) listener.onResize(columns, rows);
+        invalidate();
+    }
+
     private void updateMetrics() {
         cellWidth = Math.max(1f, (float) Math.ceil(textPaint.measureText("M")));
         Paint.FontMetrics metrics = textPaint.getFontMetrics();
@@ -115,11 +179,11 @@ public final class TerminalView extends View {
         int availableHeight = Math.max(1, height - getPaddingTop() - getPaddingBottom());
         int columns = Math.max(2, Math.min(400, (int) Math.floor(availableWidth / cellWidth)));
         int rows = Math.max(2, Math.min(200, (int) Math.floor(availableHeight / cellHeight)));
-        if (columns != lastColumns || rows != lastRows) {
-            lastColumns = columns;
-            lastRows = rows;
-            model.resize(columns, rows);
-            if (listener != null) listener.onResize(columns, rows);
+        if (columns != lastColumns || rows != lastRows
+                || columns != pendingColumns || rows != pendingRows) {
+            pendingColumns = columns;
+            pendingRows = rows;
+            if (!resizeSuspended) scheduleResizeCommit();
         }
     }
 
@@ -191,6 +255,17 @@ public final class TerminalView extends View {
         if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
             requestFocus();
             scrollToBottom();
+            // A terminal is an editor as well as a canvas. Requesting the IME
+            // here lets an observer type directly without using the command
+            // bar, while the bridge still decides whether input takes control.
+            post(() -> {
+                InputMethodManager manager = (InputMethodManager)
+                        getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+                if (manager != null) {
+                    manager.restartInput(this);
+                    manager.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT);
+                }
+            });
             return true;
         }
         if (event.getActionMasked() == MotionEvent.ACTION_UP) {
@@ -207,6 +282,105 @@ public final class TerminalView extends View {
     }
 
     @Override
+    public boolean onCheckIsTextEditor() {
+        return true;
+    }
+
+    @Override
+    public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
+        outAttrs.inputType = InputType.TYPE_CLASS_TEXT
+                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                | InputType.TYPE_TEXT_VARIATION_NORMAL;
+        outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI;
+        return new TerminalInputConnection(this);
+    }
+
+    /** InputConnection that emits only committed text to the PTY. */
+    private final class TerminalInputConnection extends BaseInputConnection {
+        TerminalInputConnection(View target) {
+            // The terminal has no editable document; composition is tracked
+            // explicitly so unfinished Pinyin never reaches the shell.
+            super(target, false);
+        }
+
+        @Override
+        public boolean setComposingText(CharSequence text, int newCursorPosition) {
+            composer.set(text);
+            invalidate();
+            return true;
+        }
+
+        @Override
+        public boolean commitText(CharSequence text, int newCursorPosition) {
+            byte[] committed = composer.commit(text);
+            if (committed.length > 0) emit(committed);
+            invalidate();
+            return true;
+        }
+
+        @Override
+        public boolean finishComposingText() {
+            // IMEs normally follow this with commitText. Do not leak a
+            // transient composition when an IME merely cancels its editor.
+            composer.clear();
+            invalidate();
+            return true;
+        }
+
+        @Override
+        public boolean deleteSurroundingText(int beforeLength, int afterLength) {
+            if (composer.deleteLastCodePoint()) {
+                invalidate();
+                return true;
+            }
+            int count = Math.max(beforeLength, afterLength);
+            if (count <= 0) return true;
+            for (int i = 0; i < count; i++) emit(TerminalInputCodec.key(
+                    TerminalInputCodec.Key.BACKSPACE));
+            return true;
+        }
+
+        @Override
+        public boolean deleteSurroundingTextInCodePoints(int beforeLength, int afterLength) {
+            return deleteSurroundingText(beforeLength, afterLength);
+        }
+
+        @Override
+        public boolean sendKeyEvent(KeyEvent event) {
+            if (event == null || event.getAction() != KeyEvent.ACTION_DOWN) return true;
+            byte[] sequence = keySequence(event.getKeyCode(), event);
+            if (sequence != null) emit(sequence);
+            else {
+                int unicode = event.getUnicodeChar();
+                if (unicode > 0) emit(TerminalInputCodec.utf8(
+                        new String(Character.toChars(unicode))));
+            }
+            return true;
+        }
+
+        @Override
+        public boolean performEditorAction(int actionCode) {
+            if (actionCode == EditorInfo.IME_ACTION_DONE
+                    || actionCode == EditorInfo.IME_ACTION_GO
+                    || actionCode == EditorInfo.IME_ACTION_SEND
+                    || actionCode == EditorInfo.IME_ACTION_NEXT) {
+                emit(TerminalInputCodec.key(TerminalInputCodec.Key.ENTER));
+                return true;
+            }
+            return super.performEditorAction(actionCode);
+        }
+
+        @Override
+        public boolean commitCompletion(android.view.inputmethod.CompletionInfo text) {
+            return text != null && commitText(text.getText(), 1);
+        }
+
+        private void emit(byte[] bytes) {
+            if (listener != null && bytes != null && bytes.length > 0) listener.onInput(bytes);
+        }
+    }
+
+    @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
         byte[] sequence = keySequence(keyCode, event);
         if (sequence != null) {
@@ -216,7 +390,7 @@ public final class TerminalView extends View {
         int unicode = event.getUnicodeChar();
         if (unicode > 0) {
             String value = new String(Character.toChars(unicode));
-            if (listener != null) listener.onInput(value.getBytes(StandardCharsets.UTF_8));
+            if (listener != null) listener.onInput(TerminalInputCodec.utf8(value));
             return true;
         }
         return super.onKeyDown(keyCode, event);
@@ -224,25 +398,31 @@ public final class TerminalView extends View {
 
     private static byte[] keySequence(int keyCode, KeyEvent event) {
         if (event.isCtrlPressed() && keyCode >= KeyEvent.KEYCODE_A && keyCode <= KeyEvent.KEYCODE_Z) {
-            return new byte[]{(byte) (keyCode - KeyEvent.KEYCODE_A + 1)};
+            return TerminalInputCodec.ctrl((char) ('A' + keyCode - KeyEvent.KEYCODE_A));
         }
-        String value = null;
+        TerminalInputCodec.Key key = null;
         switch (keyCode) {
-            case KeyEvent.KEYCODE_ESCAPE: value = "\u001b"; break;
-            case KeyEvent.KEYCODE_TAB: value = "\t"; break;
-            case KeyEvent.KEYCODE_ENTER: value = "\r"; break;
-            case KeyEvent.KEYCODE_DEL: value = "\u007f"; break;
-            case KeyEvent.KEYCODE_DPAD_UP: value = "\u001b[A"; break;
-            case KeyEvent.KEYCODE_DPAD_DOWN: value = "\u001b[B"; break;
-            case KeyEvent.KEYCODE_DPAD_RIGHT: value = "\u001b[C"; break;
-            case KeyEvent.KEYCODE_DPAD_LEFT: value = "\u001b[D"; break;
-            case KeyEvent.KEYCODE_MOVE_HOME: value = "\u001b[H"; break;
-            case KeyEvent.KEYCODE_MOVE_END: value = "\u001b[F"; break;
-            case KeyEvent.KEYCODE_PAGE_UP: value = "\u001b[5~"; break;
-            case KeyEvent.KEYCODE_PAGE_DOWN: value = "\u001b[6~"; break;
+            case KeyEvent.KEYCODE_ESCAPE: key = TerminalInputCodec.Key.ESCAPE; break;
+            case KeyEvent.KEYCODE_TAB: key = TerminalInputCodec.Key.TAB; break;
+            case KeyEvent.KEYCODE_ENTER: key = TerminalInputCodec.Key.ENTER; break;
+            case KeyEvent.KEYCODE_DEL: key = TerminalInputCodec.Key.BACKSPACE; break;
+            case KeyEvent.KEYCODE_DPAD_UP: key = TerminalInputCodec.Key.UP; break;
+            case KeyEvent.KEYCODE_DPAD_DOWN: key = TerminalInputCodec.Key.DOWN; break;
+            case KeyEvent.KEYCODE_DPAD_RIGHT: key = TerminalInputCodec.Key.RIGHT; break;
+            case KeyEvent.KEYCODE_DPAD_LEFT: key = TerminalInputCodec.Key.LEFT; break;
+            case KeyEvent.KEYCODE_MOVE_HOME: key = TerminalInputCodec.Key.HOME; break;
+            case KeyEvent.KEYCODE_MOVE_END: key = TerminalInputCodec.Key.END; break;
+            case KeyEvent.KEYCODE_PAGE_UP: key = TerminalInputCodec.Key.PAGE_UP; break;
+            case KeyEvent.KEYCODE_PAGE_DOWN: key = TerminalInputCodec.Key.PAGE_DOWN; break;
             default: break;
         }
-        return value == null ? null : value.getBytes(StandardCharsets.UTF_8);
+        return key == null ? null : TerminalInputCodec.key(key);
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        main.removeCallbacks(resizeCommit);
+        super.onDetachedFromWindow();
     }
 
     private float sp(float value) {
