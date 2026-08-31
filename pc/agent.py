@@ -531,6 +531,11 @@ class Agent:
                 prepare_shadow_catalog(self.standard_profile_path, profile_path)
             drains = self.drain_state.get("drains", [])
             self.drain_bridges = [dict(item) for item in drains if isinstance(item, dict)]
+            current_probe = probe_bridge(self.host, self.port, self.token)
+            if current_probe is not None and current_probe.generation != BRIDGE_GENERATION:
+                return self._prepare_generation_upgrade(
+                    current_probe, profile_path, self.drain_bridges,
+                )
             if not self.drain_bridges:
                 self.settings["host"], self.settings["port"] = self.host, self.port
             changed = False
@@ -614,6 +619,74 @@ class Agent:
             configured_probe.port, self.port, len(running),
         )
         return shadow_path
+
+    def _prepare_generation_upgrade(
+        self, current_probe, source_path: Path,
+        inherited_drains: list[dict[str, object]],
+    ) -> Path:
+        running = [dict(item) for item in current_probe.running_sessions]
+        current_agent_pid = process_parent_id(current_probe.pid)
+        if not running and terminate_drained_bridge(
+            current_probe.host, current_probe.port, current_probe.pid,
+        ):
+            if current_agent_pid:
+                terminate_legacy_agent(current_agent_pid)
+            self._promote_after_start = self.sidecar
+            return source_path
+
+        generation_name = "".join(
+            char if char.isalnum() or char in ("-", "_") else "-"
+            for char in BRIDGE_GENERATION
+        )
+        next_profile_path = source_path.with_name(f"profiles.{generation_name}.json")
+        prepare_shadow_catalog(source_path, next_profile_path, current_probe.catalog)
+        if self.drain_store.pointer_path is not None:
+            self.drain_store.activate_generation(BRIDGE_GENERATION)
+        next_port = find_available_port(current_probe.host, current_probe.port + 1, span=1000)
+        if next_port is None:
+            raise RuntimeError("drain_port_unavailable")
+        current_drain = {
+            "host": current_probe.host,
+            "port": current_probe.port,
+            "pid": current_probe.pid,
+            "agentPid": current_agent_pid,
+            "generation": current_probe.generation,
+            "profileIds": [
+                str(item.get("profileId")) for item in running if item.get("profileId")
+            ],
+            "startedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "emptyPolls": 0,
+        }
+        self.host, self.port = current_probe.host, next_port
+        self.drain_bridges = [current_drain, *[dict(item) for item in inherited_drains]]
+        self._initial_drain_snapshots = [(current_probe.base_url, running)]
+        for entry in inherited_drains:
+            probe = probe_bridge(
+                str(entry.get("host", self.host)), int(entry.get("port", 0)), self.token,
+            )
+            if probe is not None:
+                self._initial_drain_snapshots.append((
+                    probe.base_url, [dict(item) for item in probe.running_sessions],
+                ))
+        self.drain_state = {
+            "version": 1,
+            "primary": {
+                "host": self.host,
+                "port": self.port,
+                "pid": 0,
+                "agentPid": 0,
+                "generation": BRIDGE_GENERATION,
+                "profilePath": str(next_profile_path),
+            },
+            "drains": self.drain_bridges,
+        }
+        self._save_drain_state()
+        self.port_notice = self._drain_notice()
+        self.logger.info(
+            "bridge generation drain started old=%s new=%s active_profiles=%s",
+            current_probe.port, self.port, len(running),
+        )
+        return next_profile_path
 
     def _save_drain_state(self) -> None:
         primary = self.drain_state.get("primary")
@@ -2023,7 +2096,7 @@ def main() -> None:
         if existing is not None and existing.generation == BRIDGE_GENERATION:
             return
         sidecar = True
-        instance = SingleInstance("Local\\RelayTerm.Agent.DrainSwitchV1")
+        instance = SingleInstance(f"Local\\RelayTerm.Agent.{BRIDGE_GENERATION}")
         if not instance.acquired:
             instance.close()
             return

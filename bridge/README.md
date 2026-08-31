@@ -41,6 +41,8 @@ python -m pip install -r bridge\requirements.txt
 
 这是 profile shell 模式；bridge 从 catalog 解析工作目录、shell 和一次性启动命令。旧客户
 端继续发送 `sessionId`、`startupCommand` 和 `cwd`，进入 legacy 包装命令模式。
+Windows profile PTY 会移除继承的 `NO_COLOR`，将 `TERM/COLORTERM` 设为
+`xterm-256color/truecolor`，并让 `pwsh` 保留 ANSI 输出。
 
 `codexThreadId` 可省略，由自动/锁定绑定解析；运行中 profile 收到不同 UUID 时返回
 `codex_thread_conflict`。`ready` 增加 `profileId`、`role`、实际 `codexThreadId` 和可选

@@ -66,7 +66,7 @@ TOKEN = os.environ.get("RELAYTERM_TOKEN", "")
 MAX_SESSIONS = int(os.environ.get("RELAYTERM_MAX_SESSIONS", "16"))
 IDLE_SECONDS = int(os.environ.get("RELAYTERM_IDLE_SECONDS", "1800"))
 TIMEOUT_SECONDS = 30
-BRIDGE_GENERATION = os.environ.get("RELAYTERM_BRIDGE_GENERATION", "drain-switch-v1")
+BRIDGE_GENERATION = os.environ.get("RELAYTERM_BRIDGE_GENERATION", "codex-color-v2")
 DRAIN_STATE_PATH = os.environ.get("RELAYTERM_DRAIN_STATE_PATH", "")
 try:
     DESKTOP_TIMEOUT_SECONDS = max(

@@ -68,7 +68,10 @@ def _shell_command(spec: PtyLaunchSpec) -> str | list[str]:
         return os.environ.get("SHELL", "/bin/sh")
     if os.name == "nt":
         if spec.shell == "pwsh":
-            return [shutil.which("pwsh.exe") or shutil.which("pwsh") or "pwsh.exe", "-NoLogo"]
+            return [
+                shutil.which("pwsh.exe") or shutil.which("pwsh") or "pwsh.exe",
+                "-NoLogo", "-NoExit", "-Command", "$PSStyle.OutputRendering='Ansi'",
+            ]
         if spec.shell == "powershell":
             return [shutil.which("powershell.exe") or "powershell.exe", "-NoLogo"]
         if spec.shell == "cmd":
@@ -77,7 +80,10 @@ def _shell_command(spec: PtyLaunchSpec) -> str | list[str]:
             return [shutil.which("wsl.exe") or "wsl.exe", "--cd", spec.cwd]
         raise ValueError("profile_shell_invalid")
     if spec.shell == "pwsh" and shutil.which("pwsh"):
-        return [shutil.which("pwsh") or "pwsh", "-NoLogo"]
+        return [
+            shutil.which("pwsh") or "pwsh", "-NoLogo", "-NoExit", "-Command",
+            "$PSStyle.OutputRendering='Ansi'",
+        ]
     return os.environ.get("SHELL", "/bin/sh")
 
 
@@ -85,8 +91,13 @@ def _child_environment() -> dict[str, str]:
     environment = os.environ.copy()
     # ConPTY is a real terminal.  Some automation hosts export TERM=dumb for
     # their own pipe, which would make Codex reject the child TUI incorrectly.
-    if os.name == "nt" and environment.get("TERM", "").casefold() == "dumb":
-        environment.pop("TERM", None)
+    if os.name == "nt":
+        environment.pop("NO_COLOR", None)
+        if environment.get("TERM", "").casefold() in ("", "dumb"):
+            environment["TERM"] = "xterm-256color"
+        if not environment.get("COLORTERM"):
+            environment["COLORTERM"] = "truecolor"
+        environment.setdefault("CLICOLOR", "1")
     return environment
 
 

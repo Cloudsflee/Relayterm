@@ -19,7 +19,7 @@ from pathlib import Path
 
 from .config import SettingsStore, TokenStore, atomic_write, data_directory
 
-BRIDGE_GENERATION = "drain-switch-v1"
+BRIDGE_GENERATION = "codex-color-v2"
 DRAIN_STATE_VERSION = 1
 SHADOW_PROFILE_NAME = "profiles.v3.json"
 PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -48,7 +48,36 @@ class DrainStateStore:
     """Atomically persisted bridge topology used by the launcher and bridge."""
 
     def __init__(self, path: str | os.PathLike[str] | None = None) -> None:
-        self.path = Path(path) if path is not None else data_directory() / "drain_state.json"
+        self.pointer_path: Path | None = None
+        if path is not None:
+            self.path = Path(path)
+            return
+        root = data_directory()
+        self.pointer_path = root / "drain_state.active.json"
+        self.path = root / "drain_state.json"
+        if self.pointer_path.exists():
+            try:
+                value = json.loads(self.pointer_path.read_text(encoding="utf-8"))
+                candidate = Path(str(value.get("path", ""))).resolve()
+                if candidate.parent == root.resolve() and candidate.name.startswith("drain_state."):
+                    self.path = candidate
+            except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+
+    def activate_generation(self, generation: str) -> Path:
+        if self.pointer_path is None:
+            raise ValueError("drain_pointer_unavailable")
+        safe = "".join(
+            char if char.isalnum() or char in ("-", "_") else "-"
+            for char in str(generation)
+        ).strip("-") or "current"
+        target = self.pointer_path.with_name(f"drain_state.{safe}.json")
+        atomic_write(
+            self.pointer_path,
+            (json.dumps({"version": 1, "path": str(target)}, indent=2) + "\n").encode("utf-8"),
+        )
+        self.path = target
+        return target
 
     @staticmethod
     def empty() -> dict[str, object]:
@@ -429,7 +458,10 @@ def rollback_live_drain(*, check_only: bool = False) -> dict[str, object]:
     settings_store.save(settings)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     preserved: list[str] = []
-    for path in (store.path, Path(str(primary.get("profilePath", "") or ""))):
+    paths = [store.path, Path(str(primary.get("profilePath", "") or ""))]
+    if store.pointer_path is not None:
+        paths.append(store.pointer_path)
+    for path in paths:
         if path.exists():
             target = path.with_name(path.name + f".rollback-preserved-{stamp}")
             os.replace(path, target)

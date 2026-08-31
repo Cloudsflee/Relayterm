@@ -12,10 +12,11 @@ import time
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 from bridge import relay_bridge
 from bridge.profile_catalog import Profile, ProfileStore
-from bridge.pty_backend import PtyBackend, PtyLaunchSpec
+from bridge.pty_backend import PtyBackend, PtyLaunchSpec, _child_environment, _shell_command
 
 
 class FakeBackend:
@@ -303,6 +304,37 @@ class PtyProtocolTest(unittest.TestCase):
     "Windows pywinpty is required for the native PTY smoke test",
 )
 class WindowsPtyBackendTest(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows terminal environment")
+    def test_profile_pty_enables_truecolor_and_pwsh_ansi_rendering(self) -> None:
+        with patch.dict(os.environ, {
+            "NO_COLOR": "1", "TERM": "dumb", "COLORTERM": "",
+        }, clear=False):
+            environment = _child_environment()
+        self.assertNotIn("NO_COLOR", environment)
+        self.assertEqual("xterm-256color", environment["TERM"])
+        self.assertEqual("truecolor", environment["COLORTERM"])
+        command = _shell_command(PtyLaunchSpec.profile("pwsh", os.getcwd()))
+        self.assertIn("$PSStyle.OutputRendering='Ansi'", command)
+
+        output = bytearray()
+        exited = threading.Event()
+        backend = PtyBackend(
+            PtyLaunchSpec.profile(
+                "pwsh", os.getcwd(), 'Write-Output "`e[31mRELAYTERM_RED`e[0m"',
+            ),
+            os.getcwd(), 100, 32, output.extend, lambda _code: exited.set(),
+        )
+        try:
+            deadline = time.monotonic() + 8
+            expected = b"\x1b[31mRELAYTERM_RED\x1b[0m"
+            while expected not in output and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertIn(expected, bytes(output))
+            backend.write(b"exit\r\n")
+            self.assertTrue(exited.wait(8))
+        finally:
+            backend.close()
+
     def test_child_sees_a_terminal(self) -> None:
         output = bytearray()
         backend = PtyBackend(

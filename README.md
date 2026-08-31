@@ -34,6 +34,9 @@ WebSocket 和 sv-ttk 依赖，然后隐藏启动 `pc.agent`。界面在启动时
 支持的 shell 是 `pwsh`、`powershell`、`cmd` 和 `wsl`；Codex 会话识别首版限前三种 Windows
 原生 shell，WSL 继续使用自定义命令。配置校验要求目录存在；启动命令
 只在 profile shell 启动后写入一次，命令结束后回到 shell 提示符。
+Windows ConPTY 子进程会清除宿主工具注入的 `NO_COLOR`/`TERM=dumb`，声明 truecolor，并将
+PowerShell 7 的 `$PSStyle.OutputRendering` 设为 `Ansi`，因此 RelayTerm 不会把 Codex 或
+PowerShell 的颜色降级为黑白。
 项目列表中置顶项始终在前并保持手动顺序；其他项目按最近打开时间显示。右键项目可选择
 “上移一格”“置顶”或“取消置顶”，搜索状态下执行这些操作会恢复完整列表。
 

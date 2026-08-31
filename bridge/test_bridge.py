@@ -51,7 +51,7 @@ class BridgeProtocolTest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertTrue(value["ok"])
         self.assertEqual("relayterm", value["service"])
-        self.assertEqual("drain-switch-v1", value["bridgeGeneration"])
+        self.assertEqual("codex-color-v2", value["bridgeGeneration"])
 
     def test_authentication(self) -> None:
         status, body = self.request("/v1/exec", "POST", {"command": "echo no"})

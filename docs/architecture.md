@@ -81,6 +81,12 @@ interactive after that command returns; only the shell's own exit emits the
 session `exit` event. Legacy `/v1/exec` and WebSocket fields retain their prior
 cwd and exit-code behavior.
 
+Windows ConPTY children deliberately drop a host-injected `NO_COLOR`, replace a
+missing or `dumb` TERM with `xterm-256color`, and advertise `COLORTERM=truecolor`.
+PowerShell 7 starts with `$PSStyle.OutputRendering='Ansi'`. These values describe
+the actual Windows Terminal frontend and prevent automation-host environment
+variables from silently reducing Codex and pwsh output to monochrome.
+
 ## Codex thread catalog
 
 `CodexAppServerClient` lazily owns one `codex app-server --stdio` JSONL process,

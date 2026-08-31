@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -54,6 +55,26 @@ class DrainSwitchTest(unittest.TestCase):
         path.write_text("{broken", encoding="utf-8")
         self.assertEqual(DrainStateStore.empty(), store.load())
         self.assertEqual(1, len(list(path.parent.glob("drain_state.json.corrupt-*"))))
+
+    def test_generation_pointer_isolates_new_topology_from_old_writer(self) -> None:
+        with patch("pc.drain_switch.data_directory", return_value=self.root):
+            old_store = DrainStateStore()
+            old_store.save(DrainStateStore.empty())
+            new_store = DrainStateStore()
+            new_path = new_store.activate_generation(BRIDGE_GENERATION)
+            new_store.save({
+                "version": 1,
+                "primary": {
+                    "host": "127.0.0.1", "port": 18768, "pid": 0, "agentPid": 0,
+                    "generation": BRIDGE_GENERATION,
+                    "profilePath": str(self.root / "profiles.next.json"),
+                },
+                "drains": [],
+            })
+            old_store.save(DrainStateStore.empty())
+            selected = DrainStateStore()
+        self.assertTrue(os.path.samefile(new_path, selected.path))
+        self.assertEqual(18768, selected.load()["primary"]["port"])
 
     def test_shadow_catalog_migrates_without_touching_legacy_source(self) -> None:
         source = self.root / "profiles.json"
@@ -135,6 +156,51 @@ class DrainSwitchTest(unittest.TestCase):
         self.assertEqual(18767, persisted["primary"]["port"])
         self.assertEqual({"old"}, drain_profile_ids(persisted))
         self.assertEqual(1, json.loads(standard.read_text(encoding="utf-8"))["version"])
+
+    def test_existing_primary_generation_can_drain_to_next_port(self) -> None:
+        source = self.root / "profiles.v3.json"
+        source.write_text(json.dumps({"version": 3, "profiles": []}), encoding="utf-8")
+        state_store = DrainStateStore(self.root / "drain_state.json")
+        initial_state = state_store.save({
+            "version": 1,
+            "primary": {
+                "host": "127.0.0.1", "port": 18767, "pid": 10, "agentPid": 11,
+                "generation": "drain-switch-v1", "profilePath": str(source),
+            },
+            "drains": [],
+        })
+        probe = BridgeProbe(
+            "127.0.0.1", 18767, "drain-switch-v1", 3,
+            {"version": 3, "profiles": []},
+            ({"profileId": "active", "running": True, "pid": 99},), 10,
+        )
+        agent = Agent.__new__(Agent)
+        agent.settings = {"host": "127.0.0.1", "port": 18767}
+        agent.host, agent.port = "127.0.0.1", 18767
+        agent.token = "token"
+        agent.logger = logging.getLogger("relayterm-test-generation-drain")
+        agent.port_notice = ""
+        agent.standard_profile_path = self.root / "profiles.json"
+        agent.drain_store = state_store
+        agent.drain_state = initial_state
+        agent.drain_bridges = []
+        agent._initial_drain_snapshots = []
+        agent.sidecar = True
+        agent._promote_after_start = False
+
+        with (
+            patch("pc.agent.probe_bridge", return_value=probe),
+            patch("pc.agent.find_available_port", return_value=18768),
+            patch("pc.agent.process_parent_id", return_value=12),
+        ):
+            profile_path = agent._prepare_bridge_topology()
+
+        self.assertEqual(self.root / f"profiles.{BRIDGE_GENERATION}.json", profile_path)
+        self.assertEqual(18768, agent.port)
+        self.assertEqual(18767, agent.settings["port"])
+        self.assertEqual(["active"], agent.drain_bridges[0]["profileIds"])
+        self.assertEqual(12, agent.drain_bridges[0]["agentPid"])
+        self.assertEqual(18768, state_store.load()["primary"]["port"])
 
     def test_old_process_identity_requires_listener_pid_and_bridge_marker(self) -> None:
         with (
