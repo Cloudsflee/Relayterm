@@ -11,6 +11,7 @@ from contextlib import redirect_stdout
 from http.server import ThreadingHTTPServer
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import quote
 
 from bridge import relay_bridge
@@ -31,7 +32,13 @@ class CatalogApiTest(unittest.TestCase):
         cls.old_pairing = relay_bridge.PAIRING_MANAGER
         relay_bridge.TOKEN = "CATALOG_TOKEN"
         relay_bridge.PROFILE_STORE = ProfileStore(cls.root / "profiles.json", str(cls.root))
-        relay_bridge.PROFILE_STORE.save([Profile("project", "Project", str(cls.root), "pwsh", "", 0, True)])
+        relay_bridge.PROFILE_STORE.save([
+            Profile("project", "Project", str(cls.root), "pwsh", "", True, True),
+            Profile(
+                "codex-project", "Codex Project", str(cls.root), "pwsh", "", False, True,
+                "codex", ("--yolo",),
+            ),
+        ])
         relay_bridge.SESSION_MANAGER = SessionManager(4, 60, FakeBackend, 4096)
         relay_bridge.PAIRING_MANAGER = relay_bridge.PairingManager(120)
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), relay_bridge.RelayHandler)
@@ -79,6 +86,9 @@ class CatalogApiTest(unittest.TestCase):
         status, catalog = self.request("/v1/profiles")
         self.assertEqual(200, status)
         self.assertEqual("project", catalog["profiles"][0]["id"])
+        self.assertTrue(catalog["profiles"][0]["pinned"])
+        self.assertNotIn("order", catalog["profiles"][0])
+        self.assertEqual(3, catalog["version"])
         spec = PtyLaunchSpec.profile("pwsh", str(self.root), "")
         relay_bridge.SESSION_MANAGER.open_session(
             "project", spec, str(self.root), profile_id="project"
@@ -141,6 +151,53 @@ class CatalogApiTest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertTrue(value["ok"])
         self.assertTrue(session.ended)
+
+    def test_codex_session_routes_require_auth_and_preserve_safe_schema(self) -> None:
+        thread_id = "019c5a2f-87f6-7db0-babc-2bb3923347a3"
+
+        class Service:
+            def sessions(self, profile_id):
+                return {
+                    "profileId": profile_id, "mode": "auto",
+                    "binding": {"mode": "auto", "threadId": None, "status": "auto"},
+                    "currentRelayThread": None,
+                    "exactCandidates": [{
+                        "id": thread_id, "title": "A", "source": "cli", "cwd": str(self.root),
+                        "updatedAt": "2026-08-31T00:00:00.000Z", "matchType": "exact",
+                        "status": "notLoaded",
+                    }],
+                    "repositoryCandidates": [], "requiresSelection": False,
+                }
+
+            def set_binding(self, profile_id, value):
+                return {"profileId": profile_id, "binding": {
+                    "mode": value["mode"], "threadId": value.get("threadId"),
+                }}
+
+            def create(self, profile_id, lock=True):
+                return {"profileId": profile_id, "thread": {"id": thread_id}, "locked": lock}
+
+        service = Service()
+        service.root = self.root
+        path = "/v1/profiles/codex-project/codex-sessions"
+        with patch.object(relay_bridge, "codex_session_service", return_value=service):
+            self.assertEqual(401, self.request(path, token=None)[0])
+            status, value = self.request(path)
+            self.assertEqual(200, status)
+            self.assertEqual(thread_id, value["exactCandidates"][0]["id"])
+            self.assertEqual(
+                {"id", "title", "source", "cwd", "updatedAt", "matchType", "status"},
+                set(value["exactCandidates"][0]),
+            )
+            status, value = self.request(
+                "/v1/profiles/codex-project/codex-binding", "PUT",
+                {"mode": "locked", "threadId": thread_id},
+            )
+            self.assertEqual(200, status)
+            self.assertEqual("locked", value["binding"]["mode"])
+            status, value = self.request(path, "POST", {"lock": True})
+            self.assertEqual(201, status)
+            self.assertEqual(thread_id, value["thread"]["id"])
 
 
 if __name__ == "__main__":

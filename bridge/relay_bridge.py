@@ -23,17 +23,39 @@ from typing import Any, Optional
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 try:
+    from .codex_sessions import (
+        CodexAppServerClient,
+        CodexBindingStore,
+        CodexSessionError,
+        CodexSessionService,
+        build_codex_resume_command,
+    )
     from .profile_catalog import Profile, ProfileStore
     from .pty_backend import PtyLaunchSpec
     from .session_manager import (
-        MAX_FRAME_BYTES, PtySession, SessionAttachment, SessionManager, replay_snapshot,
+        MAX_FRAME_BYTES,
+        PtySession,
+        SessionAttachment,
+        SessionManager,
+        replay_snapshot,
         validate_session_id,
     )
 except ImportError:  # direct ``python bridge/relay_bridge.py`` invocation
+    from codex_sessions import (  # type: ignore
+        CodexAppServerClient,
+        CodexBindingStore,
+        CodexSessionError,
+        CodexSessionService,
+        build_codex_resume_command,
+    )
     from profile_catalog import Profile, ProfileStore  # type: ignore
     from pty_backend import PtyLaunchSpec  # type: ignore
     from session_manager import (  # type: ignore
-        MAX_FRAME_BYTES, PtySession, SessionAttachment, SessionManager, replay_snapshot,
+        MAX_FRAME_BYTES,
+        PtySession,
+        SessionAttachment,
+        SessionManager,
+        replay_snapshot,
         validate_session_id,
     )
 
@@ -44,6 +66,18 @@ TOKEN = os.environ.get("RELAYTERM_TOKEN", "")
 MAX_SESSIONS = int(os.environ.get("RELAYTERM_MAX_SESSIONS", "16"))
 IDLE_SECONDS = int(os.environ.get("RELAYTERM_IDLE_SECONDS", "1800"))
 TIMEOUT_SECONDS = 30
+BRIDGE_GENERATION = os.environ.get("RELAYTERM_BRIDGE_GENERATION", "drain-switch-v1")
+DRAIN_STATE_PATH = os.environ.get("RELAYTERM_DRAIN_STATE_PATH", "")
+try:
+    DESKTOP_TIMEOUT_SECONDS = max(
+        0.1,
+        float(os.environ.get(
+            "RELAYTERM_DESKTOP_TIMEOUT_SECONDS",
+            os.environ.get("RELAYTERM_DESKTOP_HEARTBEAT_TIMEOUT", "15"),
+        )),
+    )
+except (TypeError, ValueError):
+    DESKTOP_TIMEOUT_SECONDS = 15.0
 
 
 def _default_profile_path() -> Path:
@@ -57,12 +91,94 @@ def _default_profile_path() -> Path:
 
 
 PROFILE_STORE = ProfileStore(_default_profile_path(), os.environ.get("RELAYTERM_INITIAL_CWD", os.getcwd()))
-SESSION_MANAGER = SessionManager(MAX_SESSIONS, IDLE_SECONDS)
+SESSION_MANAGER = SessionManager(
+    MAX_SESSIONS, IDLE_SECONDS, desktop_timeout_seconds=DESKTOP_TIMEOUT_SECONDS,
+)
+CODEX_APP_SERVER = CodexAppServerClient()
+_CODEX_SERVICE: CodexSessionService | None = None
+_CODEX_SERVICE_KEY: tuple[int, int, int, str] | None = None
+_CODEX_SERVICE_LOCK = threading.Lock()
 
 # The legacy endpoint intentionally keeps its independent cwd model.
 SESSION_CWDS: dict[str, str] = {}
 SESSION_LOCKS: dict[str, threading.Lock] = {}
 SESSION_GUARD = threading.Lock()
+
+
+def recent_activity_store():
+    """Resolve the store lazily so tests/adapters can replace PROFILE_STORE."""
+    store = getattr(PROFILE_STORE, "recent_activity", None)
+    if store is None:
+        return None
+    return store
+
+
+def draining_profile_ids() -> set[str]:
+    if not DRAIN_STATE_PATH:
+        return set()
+    try:
+        value = json.loads(Path(DRAIN_STATE_PATH).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+        return set()
+    drains = value.get("drains", []) if isinstance(value, dict) else []
+    result: set[str] = set()
+    if not isinstance(drains, list):
+        return result
+    for item in drains:
+        ids = item.get("profileIds", []) if isinstance(item, dict) else []
+        if isinstance(ids, list):
+            result.update(str(profile_id) for profile_id in ids)
+    return result
+
+
+def codex_session_service(manager: SessionManager | None = None) -> CodexSessionService:
+    """Resolve globals lazily so tests and adapters can replace their stores."""
+    active = manager or SESSION_MANAGER
+    binding_path = str(Path(PROFILE_STORE.path).with_name("codex_bindings.json"))
+    key = (id(PROFILE_STORE), id(active), id(CODEX_APP_SERVER), binding_path)
+    global _CODEX_SERVICE, _CODEX_SERVICE_KEY
+    with _CODEX_SERVICE_LOCK:
+        if _CODEX_SERVICE is None or _CODEX_SERVICE_KEY != key:
+            _CODEX_SERVICE = CodexSessionService(
+                CODEX_APP_SERVER, CodexBindingStore(binding_path), PROFILE_STORE, active,
+            )
+            _CODEX_SERVICE_KEY = key
+        return _CODEX_SERVICE
+
+
+def record_profile_open(session: PtySession | None) -> str | None:
+    """Record a successful profile open and mirror it onto the live session."""
+    activity_store = recent_activity_store()
+    if activity_store is None:
+        return None
+    if session is None or not session.profile_id or session.ended:
+        value = activity_store.get(session.profile_id) if session and session.profile_id else None
+        if session is not None:
+            session.set_last_opened_at(value)
+        return value
+    try:
+        value = activity_store.record(session.profile_id)
+    except Exception:
+        # Activity is advisory; a read-only/corrupt activity file must not
+        # prevent a terminal from opening.
+        try:
+            value = activity_store.get(session.profile_id)
+        except Exception:
+            value = None
+    session.set_last_opened_at(value)
+    return value
+
+
+def session_statuses() -> list[dict[str, object]]:
+    """Return session status enriched from the shared activity file."""
+    activity_store = recent_activity_store()
+    activity = activity_store.load() if activity_store is not None else {}
+    values = SESSION_MANAGER.list_status()
+    for item in values:
+        profile_id = str(item.get("profileId", ""))
+        if profile_id:
+            item["lastOpenedAt"] = activity.get(profile_id, item.get("lastOpenedAt"))
+    return values
 
 
 def shell_command(command: str) -> list[str]:
@@ -208,14 +324,42 @@ def profile_for_open(profile_id: str) -> Profile:
     return profile
 
 
-def open_spec(message: dict[str, Any], query_session_id: str = "") -> tuple[str, str, str | PtyLaunchSpec, str]:
+def open_spec(
+    message: dict[str, Any], query_session_id: str = "", manager: SessionManager | None = None,
+) -> tuple[str, str, str | PtyLaunchSpec, str]:
     profile_id = str(message.get("profileId", "")).strip()
     if profile_id:
+        active = manager or SESSION_MANAGER
+        if active.get_by_profile(profile_id) is None and profile_id in draining_profile_ids():
+            raise CodexSessionError(
+                "profile_draining",
+                "该项目仍在旧版 bridge 中运行，请连接现有终端，排空后会自动转入新版",
+                status=409,
+            )
         profile = profile_for_open(profile_id)
-        spec = PtyLaunchSpec.profile(profile.shell, profile.working_directory, profile.startup_command)
+        if profile.launch_mode == "codex":
+            thread_id = codex_session_service(active).resolve(profile, message.get("codexThreadId"))
+            current = active.get_by_profile(profile.id)
+            if current is not None and not current.ended:
+                return profile.id, profile.id, current.launch_spec, current.cwd
+            command, marker = build_codex_resume_command(profile.shell, thread_id, profile.codex_args)
+            spec = PtyLaunchSpec.profile(
+                profile.shell, profile.working_directory, command,
+                codex_thread_id=thread_id, failure_marker=marker,
+            )
+        else:
+            if message.get("codexThreadId") not in (None, ""):
+                raise CodexSessionError("profile_not_codex", status=409)
+            spec = PtyLaunchSpec.profile(profile.shell, profile.working_directory, profile.startup_command)
         return profile.id, profile.id, spec, profile.working_directory
     session_id = str(message.get("sessionId", "") or query_session_id)
     return session_id, "", str(message.get("startupCommand", "codex")), str(message.get("cwd", ""))
+
+
+def websocket_error(exc: BaseException) -> dict[str, object]:
+    if isinstance(exc, CodexSessionError):
+        return {"type": "error", "code": exc.code, "message": exc.message, **exc.details}
+    return {"type": "error", "code": str(exc), "message": str(exc)}
 
 
 def pairing_page(code: str, endpoint: str) -> bytes:
@@ -405,7 +549,10 @@ class RelayHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlsplit(self.path)
         if parsed.path == "/health":
-            self.send_json(200, {"ok": True, "service": "relayterm"})
+            self.send_json(200, {
+                "ok": True, "service": "relayterm",
+                "bridgeGeneration": BRIDGE_GENERATION,
+            })
             return
         if parsed.path.startswith("/pair/"):
             code = parsed.path[len("/pair/"):]
@@ -418,13 +565,26 @@ class RelayHandler(BaseHTTPRequestHandler):
         if parsed.path == "/v1/pty":
             self._handle_websocket(parse_qs(parsed.query).get("sessionId", [""])[0])
             return
+        codex_sessions = re.fullmatch(r"/v1/profiles/([^/]+)/codex-sessions", parsed.path)
+        if codex_sessions is not None:
+            if not self.authorized():
+                self.send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                profile_id = validate_session_id(unquote(codex_sessions.group(1)))
+                self.send_json(200, codex_session_service().sessions(profile_id))
+            except CodexSessionError as exc:
+                self.send_json(exc.status, exc.payload())
+            except Exception as exc:
+                self.send_json(500, {"error": str(exc)})
+            return
         if parsed.path in ("/v1/profiles", "/v1/sessions"):
             if not self.authorized():
                 self.send_json(401, {"error": "unauthorized"})
                 return
             try:
                 value = PROFILE_STORE.catalog() if parsed.path == "/v1/profiles" else {
-                    "sessions": SESSION_MANAGER.list_status()
+                    "sessions": session_statuses()
                 }
                 self.send_json(200, value)
             except Exception as exc:
@@ -435,8 +595,10 @@ class RelayHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
         terminate = re.fullmatch(r"/v1/sessions/([^/]+)/terminate", path)
+        codex_create = re.fullmatch(r"/v1/profiles/([^/]+)/codex-sessions", path)
         public_exchange = path == "/v1/pairing/exchange"
-        if path not in ("/v1/exec", "/v1/pairing/challenges", "/v1/pairing/exchange") and terminate is None:
+        if (path not in ("/v1/exec", "/v1/pairing/challenges", "/v1/pairing/exchange")
+                and terminate is None and codex_create is None):
             self.send_json(404, {"error": "not_found"})
             return
         if not public_exchange and not self.authorized():
@@ -462,13 +624,46 @@ class RelayHandler(BaseHTTPRequestHandler):
                     })
             elif terminate is not None:
                 profile_id = validate_session_id(unquote(terminate.group(1)))
-                found = SESSION_MANAGER.terminate_profile(profile_id, bool(payload.get("force", True)))
+                if bool(payload.get("remove", False)):
+                    found = SESSION_MANAGER.remove_profile(profile_id, terminate=True)
+                else:
+                    found = SESSION_MANAGER.terminate_profile(profile_id, bool(payload.get("force", True)))
                 self.send_json(200 if found else 404, {
                     "ok": found, "profileId": profile_id,
                     **({} if found else {"error": "session_not_found"}),
                 })
+            elif codex_create is not None:
+                profile_id = validate_session_id(unquote(codex_create.group(1)))
+                value = codex_session_service().create(
+                    profile_id, lock=bool(payload.get("lock", True)),
+                )
+                self.send_json(201, value)
         except OverflowError:
             self.send_json(413, {"error": "payload_too_large"})
+        except CodexSessionError as exc:
+            self.send_json(exc.status, exc.payload())
+        except (ValueError, json.JSONDecodeError) as exc:
+            self.send_json(400, {"error": str(exc) or "invalid_json"})
+        except Exception as exc:
+            self.send_json(500, {"error": str(exc)})
+
+    def do_PUT(self) -> None:  # noqa: N802
+        path = urlsplit(self.path).path
+        binding = re.fullmatch(r"/v1/profiles/([^/]+)/codex-binding", path)
+        if binding is None:
+            self.send_json(404, {"error": "not_found"})
+            return
+        if not self.authorized():
+            self.send_json(401, {"error": "unauthorized"})
+            return
+        try:
+            payload = self.read_json()
+            profile_id = validate_session_id(unquote(binding.group(1)))
+            self.send_json(200, codex_session_service().set_binding(profile_id, payload))
+        except OverflowError:
+            self.send_json(413, {"error": "payload_too_large"})
+        except CodexSessionError as exc:
+            self.send_json(exc.status, exc.payload())
         except (ValueError, json.JSONDecodeError) as exc:
             self.send_json(400, {"error": str(exc) or "invalid_json"})
         except Exception as exc:
@@ -522,6 +717,10 @@ class RelayHandler(BaseHTTPRequestHandler):
                 for index in range(length):
                     raw[index] ^= mask[index % 4]
                 payload_bytes = bytes(raw)
+                if attachment is not None and session is not None:
+                    # Count text/binary and WebSocket control frames as
+                    # liveness signals for the desktop attachment.
+                    session.touch_attachment(attachment)
                 if opcode == 0x8:
                     if not fin or length > 125:
                         raise WebSocketProtocolError("control_frame_invalid")
@@ -552,6 +751,11 @@ class RelayHandler(BaseHTTPRequestHandler):
                         fragmented_opcode = opcode
                         fragmented.extend(payload_bytes)
                         continue
+                # A heartbeat/control frame is still proof that the desktop
+                # transport is alive.  Touch before dispatching the payload so
+                # malformed application messages cannot keep a dead socket.
+                if attachment is not None and opcode in (0x1, 0x2):
+                    session.touch_attachment(attachment)
                 if opcode == 0x2:
                     if not opened or session is None or attachment is None:
                         writer.send_event({"type": "error", "code": "not_open", "message": "open_required"})
@@ -577,7 +781,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                         continue
                     resumed = False
                     try:
-                        sid, profile_id, spec, cwd = open_spec(message, query_session_id)
+                        sid, profile_id, spec, cwd = open_spec(message, query_session_id, SESSION_MANAGER)
                         session, resumed = SESSION_MANAGER.open_session(
                             sid, spec, cwd, message.get("cols", 100), message.get("rows", 32),
                             bool(message.get("resume", True)), profile_id=profile_id,
@@ -593,11 +797,15 @@ class RelayHandler(BaseHTTPRequestHandler):
                             defer_output=True,
                         )
                         session.ensure_started()
+                        ended = session.ended
                         opened = True
+                        last_opened_at = record_profile_open(session)
                         writer.send_event_priority({
                             "type": "ready", "sessionId": session.session_id,
                             "profileId": session.profile_id, "pid": session.pid,
                             "resumed": bool(resumed), "role": session.role_for(attachment),
+                            "lastOpenedAt": last_opened_at,
+                            "codexThreadId": session.codex_thread_id or None,
                         })
                         snapshot = replay_snapshot(snapshot, client_type, bool(resumed))
                         if not attachment.activate_output(snapshot):
@@ -607,7 +815,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                     except Exception as exc:
                         _cleanup_open_failure(SESSION_MANAGER, session, attachment, resumed)
                         attachment = None
-                        writer.send_event({"type": "error", "code": str(exc), "message": str(exc)})
+                        writer.send_event(websocket_error(exc))
                         break
                 elif message_type == "resize" and session is not None and attachment is not None:
                     try:
@@ -619,14 +827,15 @@ class RelayHandler(BaseHTTPRequestHandler):
                         session.signal_from(attachment, str(message.get("name", "")))
                     except Exception as exc:
                         writer.send_event({"type": "error", "code": str(exc), "message": str(exc)})
-                elif message_type == "ping":
+                elif message_type in ("ping", "heartbeat"):
                     writer.send_event({"type": "pong"})
                 elif message_type == "close":
                     if session is not None:
                         if bool(message.get("terminate", False)):
                             session.terminate(True)
                         if attachment is not None:
-                            session.detach(attachment, invoke_close=False)
+                            reason = str(message.get("reason", ""))
+                            session.detach(attachment, invoke_close=False, reason=reason)
                             attachment = None
                     break
                 else:
@@ -662,7 +871,10 @@ def create_app(manager: SessionManager | None = None, token: str | None = None):
         return is_authorized(request.headers.get("Authorization", ""), required_token)
 
     async def health(_request):
-        return web.json_response({"ok": True, "service": "relayterm"})
+        return web.json_response({
+            "ok": True, "service": "relayterm",
+            "bridgeGeneration": BRIDGE_GENERATION,
+        })
 
     async def profiles(request):
         if not authorized(request):
@@ -672,7 +884,58 @@ def create_app(manager: SessionManager | None = None, token: str | None = None):
     async def sessions(request):
         if not authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
-        return web.json_response({"sessions": active.list_status()})
+        activity_store = recent_activity_store()
+        activity = activity_store.load() if activity_store is not None else {}
+        values = active.list_status()
+        for item in values:
+            profile_id = str(item.get("profileId", ""))
+            if profile_id:
+                item["lastOpenedAt"] = activity.get(profile_id, item.get("lastOpenedAt"))
+        return web.json_response({"sessions": values})
+
+    async def codex_sessions_route(request):
+        if not authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            profile_id = validate_session_id(request.match_info["profile_id"])
+            value = await asyncio.to_thread(codex_session_service(active).sessions, profile_id)
+            return web.json_response(value)
+        except CodexSessionError as exc:
+            return web.json_response(exc.payload(), status=exc.status)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def codex_binding_route(request):
+        if not authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            profile_id = validate_session_id(request.match_info["profile_id"])
+            payload = await request.json()
+            value = await asyncio.to_thread(
+                codex_session_service(active).set_binding, profile_id, payload,
+            )
+            return web.json_response(value)
+        except CodexSessionError as exc:
+            return web.json_response(exc.payload(), status=exc.status)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+    async def codex_create_route(request):
+        if not authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            profile_id = validate_session_id(request.match_info["profile_id"])
+            payload = await request.json() if request.can_read_body else {}
+            value = await asyncio.to_thread(
+                codex_session_service(active).create,
+                profile_id,
+                lock=bool(payload.get("lock", True)),
+            )
+            return web.json_response(value, status=201)
+        except CodexSessionError as exc:
+            return web.json_response(exc.payload(), status=exc.status)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
 
     async def exec_route(request):
         if not authorized(request):
@@ -690,7 +953,10 @@ def create_app(manager: SessionManager | None = None, token: str | None = None):
         try:
             profile_id = validate_session_id(profile_id)
             payload = await request.json() if request.can_read_body else {}
-            found = active.terminate_profile(profile_id, bool(payload.get("force", True)))
+            if bool(payload.get("remove", False)):
+                found = active.remove_profile(profile_id, terminate=True)
+            else:
+                found = active.terminate_profile(profile_id, bool(payload.get("force", True)))
             return web.json_response({"ok": found, "profileId": profile_id}, status=200 if found else 404)
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=400)
@@ -726,7 +992,9 @@ def create_app(manager: SessionManager | None = None, token: str | None = None):
     async def pty_route(request):
         if not authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
-        websocket = web.WebSocketResponse(max_msg_size=MAX_FRAME_BYTES, heartbeat=25)
+        websocket = web.WebSocketResponse(
+            max_msg_size=MAX_FRAME_BYTES, heartbeat=25, autoping=False,
+        )
         await websocket.prepare(request)
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue(maxsize=128)
@@ -783,6 +1051,18 @@ def create_app(manager: SessionManager | None = None, token: str | None = None):
         pump_task = asyncio.create_task(pump())
         try:
             async for message in websocket:
+                if attachment is not None and session is not None:
+                    # aiohttp exposes protocol ping/pong frames as messages on
+                    # some versions and application JSON frames on all; both
+                    # count as an inbound heartbeat.
+                    session.touch_attachment(attachment)
+                if message.type == web.WSMsgType.PING:
+                    if attachment is not None:
+                        session.touch_attachment(attachment)
+                    await websocket.pong(message.data)
+                    continue
+                if message.type == web.WSMsgType.PONG:
+                    continue
                 if message.type == web.WSMsgType.BINARY:
                     if session is None or attachment is None:
                         enqueue("event", {"type": "error", "code": "not_open", "message": "open_required"})
@@ -806,7 +1086,9 @@ def create_app(manager: SessionManager | None = None, token: str | None = None):
                             raise ValueError("already_open")
                         resumed = False
                         try:
-                            sid, profile_id, spec, cwd = open_spec(payload, request.query.get("sessionId", ""))
+                            sid, profile_id, spec, cwd = await asyncio.to_thread(
+                                open_spec, payload, request.query.get("sessionId", ""), active,
+                            )
                             session, resumed = active.open_session(
                                 sid, spec, cwd, payload.get("cols", 100), payload.get("rows", 32),
                                 bool(payload.get("resume", True)), profile_id=profile_id,
@@ -824,11 +1106,15 @@ def create_app(manager: SessionManager | None = None, token: str | None = None):
                                 defer_output=True,
                             )
                             session.ensure_started()
+                            ended = session.ended
                             opened = True
+                            last_opened_at = record_profile_open(session)
                             await websocket.send_json({
                                 "type": "ready", "sessionId": session.session_id,
                                 "profileId": session.profile_id, "pid": session.pid,
                                 "resumed": bool(resumed), "role": session.role_for(attachment),
+                                "lastOpenedAt": last_opened_at,
+                                "codexThreadId": session.codex_thread_id or None,
                             })
                             snapshot = replay_snapshot(snapshot, client_type, bool(resumed))
                             if not attachment.activate_output(snapshot):
@@ -841,19 +1127,26 @@ def create_app(manager: SessionManager | None = None, token: str | None = None):
                             _cleanup_open_failure(active, session, attachment, resumed)
                             attachment = None
                             if not websocket.closed:
-                                await websocket.send_json({
-                                    "type": "error", "code": str(exc), "message": str(exc),
-                                })
+                                await websocket.send_json(websocket_error(exc))
                             break
                     elif message_type == "resize" and session is not None and attachment is not None:
                         session.resize_from(attachment, payload.get("rows", 32), payload.get("cols", 100))
                     elif message_type == "signal" and session is not None and attachment is not None:
                         session.signal_from(attachment, str(payload.get("name", "")))
-                    elif message_type == "ping":
+                    elif message_type in ("ping", "heartbeat"):
+                        if attachment is not None:
+                            session.touch_attachment(attachment)
                         enqueue("event", {"type": "pong"})
                     elif message_type == "close":
                         if session is not None and bool(payload.get("terminate", False)):
                             session.terminate(True)
+                        if session is not None and attachment is not None:
+                            session.detach(
+                                attachment,
+                                invoke_close=False,
+                                reason=str(payload.get("reason", "")),
+                            )
+                            attachment = None
                         break
                     else:
                         raise ValueError("message_invalid")
@@ -875,6 +1168,9 @@ def create_app(manager: SessionManager | None = None, token: str | None = None):
     app.router.add_get("/health", health)
     app.router.add_get("/v1/profiles", profiles)
     app.router.add_get("/v1/sessions", sessions)
+    app.router.add_get("/v1/profiles/{profile_id}/codex-sessions", codex_sessions_route)
+    app.router.add_put("/v1/profiles/{profile_id}/codex-binding", codex_binding_route)
+    app.router.add_post("/v1/profiles/{profile_id}/codex-sessions", codex_create_route)
     app.router.add_post("/v1/exec", exec_route)
     app.router.add_post("/v1/sessions/{profile_id}/terminate", terminate_route)
     app.router.add_post("/v1/pairing/challenges", create_pairing)
@@ -895,6 +1191,7 @@ def main() -> None:
     finally:
         server.server_close()
         SESSION_MANAGER.shutdown()
+        CODEX_APP_SERVER.shutdown()
 
 
 if __name__ == "__main__":

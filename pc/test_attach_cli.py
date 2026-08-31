@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+import json
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from pc.attach_cli import MAX_FRAME_BYTES, SPECIAL_KEYS, connect_stream, read_key, send_input_batch
+from pc.attach_cli import (
+    MAX_FRAME_BYTES,
+    SPECIAL_KEYS,
+    build_open_message,
+    connect_stream,
+    read_key,
+    send_input_batch,
+    send_terminal_closed,
+    start_heartbeat,
+)
 
 
 class AttachCliTest(unittest.TestCase):
@@ -65,6 +76,33 @@ class AttachCliTest(unittest.TestCase):
             [value[:MAX_FRAME_BYTES], value[MAX_FRAME_BYTES:]],
             [call.args[0] for call in stream.send_binary.call_args_list],
         )
+
+    def test_terminal_close_message_preserves_pty(self):
+        stream = Mock()
+        stream.send.return_value = 1
+        self.assertTrue(send_terminal_closed(stream))
+        self.assertEqual({
+            "type": "close", "terminate": False, "reason": "terminal_closed",
+        }, json.loads(stream.send.call_args.args[0]))
+
+    def test_heartbeat_sends_application_ping(self):
+        stream = Mock()
+        sent = threading.Event()
+        stream.send.side_effect = lambda _value: sent.set() or 1
+        stop = threading.Event()
+        thread = start_heartbeat(stream, stop, interval=0.01)
+        self.assertTrue(sent.wait(0.4))
+        stop.set()
+        thread.join(timeout=1)
+        self.assertEqual("ping", json.loads(stream.send.call_args.args[0])["type"])
+
+    def test_open_message_carries_explicit_codex_uuid(self):
+        thread_id = "019c5a2f-87f6-7db0-babc-2bb3923347a3"
+        value = build_open_message(
+            "profile", "desktop", 140, 42, fresh=True, codex_thread_id=thread_id,
+        )
+        self.assertEqual(thread_id, value["codexThreadId"])
+        self.assertFalse(value["resume"])
 
 
 if __name__ == "__main__":

@@ -6,12 +6,15 @@ import importlib.util
 import json
 import os
 import socket
+import tempfile
 import threading
 import time
 import unittest
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 
 from bridge import relay_bridge
+from bridge.profile_catalog import Profile, ProfileStore
 from bridge.pty_backend import PtyBackend, PtyLaunchSpec
 
 
@@ -175,6 +178,41 @@ class PtyProtocolTest(unittest.TestCase):
         backend = relay_bridge.SESSION_MANAGER.sessions["profile-a"].backend
         self.assertEqual((90, 20), (backend.cols, backend.rows))
         close_stream(second)
+
+    def test_profile_ready_records_recent_open_and_desktop_close_keeps_pty(self) -> None:
+        previous_store = relay_bridge.PROFILE_STORE
+        with tempfile.TemporaryDirectory(prefix="relayterm-profile-ready-") as directory:
+            relay_bridge.PROFILE_STORE = ProfileStore(Path(directory) / "profiles.json", directory)
+            relay_bridge.PROFILE_STORE.save([Profile("recent-profile", "Recent", directory)])
+            stream = self.connect("recent-profile")
+            try:
+                send_frame(stream, 1, json.dumps({
+                    "type": "open", "profileId": "recent-profile",
+                    "clientId": "desktop-recent", "clientType": "desktop",
+                }).encode())
+                stream.settimeout(3)
+                ready = json.loads(read_frame(stream)[1])
+                read_frame(stream)  # startup output
+                self.assertEqual("ready", ready["type"])
+                self.assertTrue(ready["lastOpenedAt"].endswith("Z"))
+                self.assertEqual(
+                    ready["lastOpenedAt"],
+                    relay_bridge.PROFILE_STORE.catalog()["profiles"][0]["lastOpenedAt"],
+                )
+                send_frame(stream, 1, json.dumps({
+                    "type": "close", "reason": "terminal_closed", "terminate": False,
+                }).encode())
+                for _ in range(30):
+                    status = relay_bridge.SESSION_MANAGER.get("recent-profile").status()
+                    if status["desktopState"] == "closed":
+                        break
+                    time.sleep(0.01)
+                self.assertEqual("closed", status["desktopState"])
+                self.assertFalse(status["desktopConnected"])
+                self.assertFalse(relay_bridge.SESSION_MANAGER.get("recent-profile").backend.dead)
+            finally:
+                stream.close()
+                relay_bridge.PROFILE_STORE = previous_store
 
     def test_missing_token_is_rejected(self) -> None:
         stream = socket.create_connection(("127.0.0.1", self.server.server_port), timeout=3)

@@ -7,6 +7,7 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
+import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
@@ -26,6 +27,10 @@ public final class TerminalStore {
     }
 
     public synchronized List<TerminalProfile> load() {
+        return sortProfiles(loadPersisted());
+    }
+
+    private List<TerminalProfile> loadPersisted() {
         String raw = preferences.getString(PROFILES, "");
         List<TerminalProfile> result = new ArrayList<>();
         boolean migrated = false;
@@ -35,7 +40,10 @@ public final class TerminalStore {
                 for (int i = 0; i < array.length(); i++) {
                     JSONObject item = array.getJSONObject(i);
                     if (!item.has("startupCommand") || !item.has("workingDirectory")
-                            || !item.has("managed") || !item.has("remoteProfileId")) migrated = true;
+                            || !item.has("managed") || !item.has("remoteProfileId")
+                            || !item.has("lastOpenedAt") || !item.has("pinned")
+                            || !item.has("launchMode") || !item.has("codexArgs")
+                            || item.has("order")) migrated = true;
                     try {
                         result.add(TerminalProfile.fromJson(item, secrets));
                     } catch (Exception ignored) {
@@ -74,7 +82,7 @@ public final class TerminalStore {
     }
 
     public synchronized void upsert(TerminalProfile profile) {
-        List<TerminalProfile> all = load();
+        List<TerminalProfile> all = loadPersisted();
         boolean replaced = false;
         for (int i = 0; i < all.size(); i++) {
             if (all.get(i).id.equals(profile.id)) {
@@ -88,7 +96,7 @@ public final class TerminalStore {
     }
 
     public synchronized void remove(String id) {
-        List<TerminalProfile> all = load();
+        List<TerminalProfile> all = loadPersisted();
         all.removeIf(profile -> profile.id.equals(id)
                 || (profile.managed && profile.connectionId.equals(id)));
         save(all);
@@ -99,15 +107,60 @@ public final class TerminalStore {
 
     /** Replace only one connection's cached server catalog; manual profiles stay untouched. */
     public synchronized void replaceManaged(String connectionId, List<TerminalProfile> managed) {
-        List<TerminalProfile> all = load();
+        save(replaceManagedProfiles(loadPersisted(), connectionId, managed));
+    }
+
+    static List<TerminalProfile> replaceManagedProfiles(
+            List<TerminalProfile> existing, String connectionId,
+            List<TerminalProfile> managed) {
+        List<TerminalProfile> all = new ArrayList<>(existing);
+        int insertion = all.size();
+        for (int i = 0; i < all.size(); i++) {
+            TerminalProfile profile = all.get(i);
+            if (profile.managed && profile.connectionId.equals(connectionId)) {
+                insertion = Math.min(insertion, i);
+            }
+        }
         all.removeIf(profile -> profile.managed && profile.connectionId.equals(connectionId));
-        all.addAll(managed);
-        save(all);
+        all.addAll(Math.min(insertion, all.size()), managed);
+        return all;
+    }
+
+    /** Return a copy sorted by recent successful opens, with stable fallbacks. */
+    public static List<TerminalProfile> sortProfiles(List<TerminalProfile> profiles) {
+        return TerminalProfile.sortByRecent(profiles);
+    }
+
+    /** Parse an activity timestamp for JVM callers and tests. */
+    public static Instant parseLastOpenedAt(String value) {
+        return TerminalProfile.parseLastOpenedAt(value);
+    }
+
+    /** Persist a bridge-provided timestamp for one cached/manual profile. */
+    public synchronized boolean updateLastOpenedAt(String id, String timestamp) {
+        if (id == null || id.trim().isEmpty() || TerminalProfile.parseLastOpenedAt(timestamp) == null) {
+            return false;
+        }
+        List<TerminalProfile> all = loadPersisted();
+        for (int i = 0; i < all.size(); i++) {
+            TerminalProfile profile = all.get(i);
+            if (profile.id.equals(id)) {
+                all.set(i, profile.withLastOpenedAt(timestamp));
+                save(all);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public synchronized boolean markOpened(String id) {
+        return updateLastOpenedAt(id,
+                java.time.Instant.now().toString());
     }
 
     public synchronized List<TerminalProfile> manualConnections() {
         List<TerminalProfile> result = new ArrayList<>();
-        for (TerminalProfile profile : load()) {
+        for (TerminalProfile profile : loadPersisted()) {
             if (!profile.managed && !profile.isLocal()) result.add(profile);
         }
         return result;

@@ -12,8 +12,16 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Any
 
-from bridge.profile_catalog import Profile, ProfileStore
-
+from bridge.profile_catalog import (
+    Profile,
+    ProfileStore,
+    RecentActivityStore,
+    move_profile_up,
+    parse_utc_timestamp,
+    pin_profile,
+    sort_profiles_by_recent,
+    unpin_profile,
+)
 
 APP_NAME = "RelayTerm"
 
@@ -158,6 +166,8 @@ def profile_store(initial_directory: str | None = None) -> ProfileStore:
 
 
 __all__ = [
-    "Profile", "ProfileStore", "SettingsStore", "TokenStore", "atomic_write",
-    "data_directory", "dpapi_protect", "dpapi_unprotect", "profile_store",
+    "Profile", "ProfileStore", "RecentActivityStore", "SettingsStore", "TokenStore",
+    "atomic_write", "data_directory", "dpapi_protect", "dpapi_unprotect",
+    "move_profile_up", "parse_utc_timestamp", "pin_profile", "profile_store",
+    "sort_profiles_by_recent", "unpin_profile",
 ]

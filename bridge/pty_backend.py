@@ -30,14 +30,22 @@ class PtyLaunchSpec:
     shell: str
     cwd: str
     startup_command: str = ""
+    codex_thread_id: str = ""
+    failure_marker: str = ""
 
     @classmethod
     def legacy(cls, command: str, cwd: str) -> "PtyLaunchSpec":
         return cls("legacy", "cmd" if os.name == "nt" else "sh", cwd, command)
 
     @classmethod
-    def profile(cls, shell: str, cwd: str, startup_command: str = "") -> "PtyLaunchSpec":
-        return cls("profile", shell.strip().lower(), cwd, startup_command)
+    def profile(
+        cls, shell: str, cwd: str, startup_command: str = "", *,
+        codex_thread_id: str = "", failure_marker: str = "",
+    ) -> "PtyLaunchSpec":
+        return cls(
+            "profile", shell.strip().lower(), cwd, startup_command,
+            str(codex_thread_id or ""), str(failure_marker or ""),
+        )
 
 
 def _normalise_cwd(cwd: str | None) -> str:
@@ -73,6 +81,15 @@ def _shell_command(spec: PtyLaunchSpec) -> str | list[str]:
     return os.environ.get("SHELL", "/bin/sh")
 
 
+def _child_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    # ConPTY is a real terminal.  Some automation hosts export TERM=dumb for
+    # their own pipe, which would make Codex reject the child TUI incorrectly.
+    if os.name == "nt" and environment.get("TERM", "").casefold() == "dumb":
+        environment.pop("TERM", None)
+    return environment
+
+
 class PtyBackend:
     """A running interactive process with a byte-oriented interface."""
 
@@ -96,7 +113,8 @@ class PtyBackend:
             self.startup_command = "codex"
         self.cwd = _normalise_cwd(self.launch_spec.cwd or cwd)
         self.launch_spec = PtyLaunchSpec(
-            self.launch_spec.mode, self.launch_spec.shell, self.cwd, self.startup_command
+            self.launch_spec.mode, self.launch_spec.shell, self.cwd, self.startup_command,
+            self.launch_spec.codex_thread_id, self.launch_spec.failure_marker,
         )
         self.cols = max(2, min(int(cols or 100), 400))
         self.rows = max(2, min(int(rows or 32), 200))
@@ -112,6 +130,7 @@ class PtyBackend:
         self._using_winpty = False
         self.cwd_marker = "__RELAYTERM_PTY_CWD_" + uuid.uuid4().hex + "__"
         self.current_cwd = self.cwd
+        self.startup_error_code: int | None = None
         self._output_pending = bytearray()
         self._start()
 
@@ -137,6 +156,7 @@ class PtyBackend:
                     _shell_command(self.launch_spec),
                     dimensions=(self.rows, self.cols),
                     cwd=self.cwd,
+                    env=_child_environment(),
                 )
                 self._using_winpty = True
             except Exception:
@@ -145,7 +165,7 @@ class PtyBackend:
 
                     pty = winpty.PTY(self.cols, self.rows)
                     command = _shell_command(self.launch_spec)
-                    pty.spawn(command, cwd=self.cwd)
+                    pty.spawn(command, cwd=self.cwd, env=_child_environment())
                     self._proc = pty
                     self._using_winpty = True
                 except Exception:
@@ -201,6 +221,7 @@ class PtyBackend:
             stderr=subprocess.STDOUT,
             bufsize=0,
             creationflags=creationflags,
+            env=_child_environment(),
         )
         self._stdin = self._proc.stdin
 
@@ -288,13 +309,16 @@ class PtyBackend:
                 pass
 
     def _emit_output(self, data: bytes) -> None:
-        """Remove the private cwd marker before bytes reach the phone."""
+        """Remove private cwd/startup markers before bytes reach clients."""
 
-        if self.launch_spec.mode == "profile":
+        marker_text = (
+            self.launch_spec.failure_marker
+            if self.launch_spec.mode == "profile" else self.cwd_marker
+        )
+        if not marker_text:
             self.on_output(data)
             return
-
-        marker = self.cwd_marker.encode("ascii")
+        marker = marker_text.encode("ascii")
         combined = bytes(self._output_pending) + data
         self._output_pending.clear()
         visible = bytearray()
@@ -314,6 +338,13 @@ class PtyBackend:
                     combined = combined[-keep:] if keep else b""
                 self._output_pending.extend(combined)
                 break
+            # Shell input echo can contain the marker inside the wrapper
+            # command.  Only a marker beginning a new output line is private.
+            if index > 0 and combined[index - 1] not in (10, 13):
+                end = index + len(marker)
+                visible.extend(combined[:end])
+                combined = combined[end:]
+                continue
             visible.extend(combined[:index])
             remainder = combined[index + len(marker):]
             newline = -1
@@ -324,9 +355,18 @@ class PtyBackend:
             if newline < 0:
                 self._output_pending.extend(combined[index:])
                 break
-            path = remainder[:newline].decode("utf-8", "replace").strip()
-            if path and os.path.isdir(path):
-                self.current_cwd = os.path.abspath(path)
+            payload = remainder[:newline].decode("utf-8", "replace").strip()
+            if self.launch_spec.mode == "profile":
+                try:
+                    self.startup_error_code = int(payload)
+                except (TypeError, ValueError):
+                    # A user command that printed the private prefix is normal
+                    # terminal output unless it carries the numeric wrapper code.
+                    visible.extend(marker)
+                    visible.extend(remainder[:newline])
+                    visible.extend(b"\r\n")
+            elif payload and os.path.isdir(payload):
+                self.current_cwd = os.path.abspath(payload)
             skip = newline
             while skip < len(remainder) and remainder[skip] in (10, 13): skip += 1
             combined = remainder[skip:]

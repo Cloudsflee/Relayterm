@@ -24,9 +24,9 @@ class PanelSmokeTest(unittest.TestCase):
         base = Path(cls.temp.name)
         (base / "long" / "working" / "directory").mkdir(parents=True)
         cls.profiles = [
-            Profile("one", "Alpha", str(base), "pwsh", "", 0, True),
-            Profile("two", "Disabled", str(base), "cmd", "echo disabled", 1, False),
-            Profile("three", "Long command", str(base / "long" / "working" / "directory"), "wsl", "echo " + "x" * 400, 2, True),
+            Profile("one", "Alpha", str(base), "pwsh", "", True, True),
+            Profile("two", "Disabled", str(base), "cmd", "echo disabled", False, False),
+            Profile("three", "Long command", str(base / "long" / "working" / "directory"), "wsl", "echo " + "x" * 400, False, True),
         ]
         agent = Agent.__new__(Agent)
         agent.root = cls.root
@@ -44,6 +44,7 @@ class PanelSmokeTest(unittest.TestCase):
         agent.edit_button = agent.delete_button = agent.stop_button = agent.open_button = None
         agent.icon_font = icon_font(cls.root)
         agent.profiles = list(cls.profiles)
+        agent.catalog_profiles = list(cls.profiles)
         agent.sessions = {
             "one": {"running": True, "desktopConnected": True, "pid": 1234, "cwd": str(base), "attachmentCount": 1, "controller": {"clientType": "desktop"}},
             "three": {"running": False, "lastActivityAt": "2026-08-10T19:20:00+00:00", "cwd": str(base), "attachmentCount": 0},
@@ -113,10 +114,50 @@ class PanelSmokeTest(unittest.TestCase):
         ):
             self.agent.start_selected()
         command = popen.call_args.args[0]
-        self.assertEqual(["-w", "0"], command[1:3])
+        self.assertEqual(["-w", "new"], command[1:3])
+        self.assertEqual("140,42", command[command.index("--size") + 1])
         self.assertIn("--suppressApplicationTitle", command)
         self.assertEqual(r"C:\Python\python.exe", command[command.index("--startingDirectory") + 2])
         after.assert_called_once()
+
+    def test_running_drain_session_uses_legacy_bridge_endpoint(self):
+        self.agent.tree.selection_set("one")
+        self.root.update()
+        previous_routes = getattr(self.agent, "session_routes", {})
+        try:
+            self.agent.session_routes = {"one": "http://127.0.0.1:18766"}
+            with (
+                patch("pc.agent._console_python_executable", return_value=r"C:\Python\python.exe"),
+                patch("pc.agent.subprocess.Popen") as popen,
+                patch.object(self.agent.root, "after"),
+            ):
+                self.agent.start_selected()
+            command = popen.call_args.args[0]
+            self.assertEqual("127.0.0.1", command[command.index("--host") + 1])
+            self.assertEqual("18766", command[command.index("--port") + 1])
+        finally:
+            self.agent.session_routes = previous_routes
+
+    def test_closed_terminal_resumes_but_exited_shell_starts_fresh(self):
+        self.agent.tree.selection_set("one")
+        self.root.update()
+        original = self.agent.sessions["one"]
+        try:
+            with (
+                patch("pc.agent._console_python_executable", return_value=r"C:\Python\python.exe"),
+                patch("pc.agent.subprocess.Popen") as popen,
+                patch.object(self.agent.root, "after"),
+            ):
+                self.agent.sessions["one"] = {
+                    "running": True, "desktopConnected": False, "desktopState": "closed",
+                }
+                self.agent.start_selected()
+                self.assertNotIn("--fresh", popen.call_args.args[0])
+                self.agent.sessions["one"] = {"running": False, "state": "exited"}
+                self.agent.start_selected()
+                self.assertIn("--fresh", popen.call_args.args[0])
+        finally:
+            self.agent.sessions["one"] = original
 
     def test_initial_panel_has_no_selection_or_detail(self):
         self.agent.tree.selection_remove(*self.agent.tree.selection())

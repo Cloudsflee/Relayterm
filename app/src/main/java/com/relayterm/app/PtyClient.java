@@ -23,7 +23,16 @@ import okio.ByteString;
 public final class PtyClient {
     public interface Listener {
         void onConnecting(String profileId, int attempt);
-        void onReady(String profileId, int pid, boolean resumed, String role);
+        default void onReady(String profileId, int pid, boolean resumed, String role) { }
+        /** Newer bridge responses carry the shared activity timestamp. */
+        default void onReady(String profileId, int pid, boolean resumed, String role,
+                             String lastOpenedAt) {
+            onReady(profileId, pid, resumed, role);
+        }
+        default void onReady(String profileId, int pid, boolean resumed, String role,
+                             String lastOpenedAt, String codexThreadId) {
+            onReady(profileId, pid, resumed, role, lastOpenedAt);
+        }
         void onOutput(String profileId, byte[] bytes);
         void onEvent(String profileId, JSONObject event);
         void onExit(String profileId, int code, String cwd);
@@ -47,6 +56,8 @@ public final class PtyClient {
     private volatile boolean connected;
     private volatile boolean manualClose = true;
     private volatile boolean sessionEnded;
+    private volatile String lastOpenedAt = "";
+    private volatile String codexThreadId = "";
     private volatile int columns = 100;
     private volatile int rows = 32;
     private TerminalProfile profile;
@@ -72,6 +83,16 @@ public final class PtyClient {
             int rows,
             boolean resume,
             Listener listener) {
+        connect(profile, columns, rows, resume, "", listener);
+    }
+
+    public synchronized void connect(
+            TerminalProfile profile,
+            int columns,
+            int rows,
+            boolean resume,
+            String codexThreadId,
+            Listener listener) {
         manualClose = true;
         generation.incrementAndGet();
         disconnectInternal();
@@ -84,6 +105,8 @@ public final class PtyClient {
         this.reconnectScheduledFor = -1L;
         this.manualClose = false;
         this.sessionEnded = false;
+        this.lastOpenedAt = "";
+        this.codexThreadId = codexThreadId == null ? "" : codexThreadId.trim();
         long operation = generation.incrementAndGet();
         connectAttempt(operation, profile, listener);
     }
@@ -110,21 +133,10 @@ public final class PtyClient {
                     webSocket.cancel();
                     return;
                 }
-                JSONObject open = new JSONObject();
                 try {
-                    open.put("type", "open");
-                    open.put("sessionId", selected.id);
-                    open.put("clientId", clientId);
-                    open.put("clientType", "android");
-                    if (selected.managed) {
-                        open.put("profileId", selected.remoteProfileId);
-                    } else {
-                        open.put("startupCommand", selected.startupCommand);
-                        open.put("cwd", selected.workingDirectory);
-                    }
-                    open.put("cols", columns);
-                    open.put("rows", rows);
-                    open.put("resume", PtyClient.this.resume);
+                    JSONObject open = buildOpenMessage(
+                            selected, clientId, columns, rows, PtyClient.this.resume,
+                            PtyClient.this.codexThreadId);
                     if (!webSocket.send(open.toString())) throw new Exception("open_send_failed");
                 } catch (Exception error) {
                     webSocket.cancel();
@@ -153,7 +165,12 @@ public final class PtyClient {
                         int pid = event.optInt("pid", 0);
                         boolean resumedEvent = event.optBoolean("resumed", false);
                         String role = event.optString("role", "observer");
-                        post(operation, () -> callback.onReady(selected.id, pid, resumedEvent, role));
+                        String lastOpenedAt = event.optString("lastOpenedAt", "");
+                        PtyClient.this.lastOpenedAt = lastOpenedAt == null ? "" : lastOpenedAt;
+                        String codexThreadId = event.optString("codexThreadId", "");
+                        PtyClient.this.codexThreadId = codexThreadId == null ? "" : codexThreadId;
+                        post(operation, () -> callback.onReady(
+                                selected.id, pid, resumedEvent, role, lastOpenedAt, codexThreadId));
                     } else if ("exit".equals(type)) {
                         connected = false;
                         sessionEnded = true;
@@ -205,6 +222,29 @@ public final class PtyClient {
         });
     }
 
+    static JSONObject buildOpenMessage(
+            TerminalProfile selected, String clientId, int columns, int rows,
+            boolean resume, String codexThreadId) throws Exception {
+        JSONObject open = new JSONObject();
+        open.put("type", "open");
+        open.put("sessionId", selected.id);
+        open.put("clientId", clientId);
+        open.put("clientType", "android");
+        if (selected.managed) {
+            open.put("profileId", selected.remoteProfileId);
+            if (codexThreadId != null && !codexThreadId.trim().isEmpty()) {
+                open.put("codexThreadId", codexThreadId.trim());
+            }
+        } else {
+            open.put("startupCommand", selected.startupCommand);
+            open.put("cwd", selected.workingDirectory);
+        }
+        open.put("cols", columns);
+        open.put("rows", rows);
+        open.put("resume", resume);
+        return open;
+    }
+
     private synchronized void handleFailure(
             long operation, TerminalProfile selected, Listener callback, String detail) {
         if (!isCurrent(operation) || manualClose) return;
@@ -246,6 +286,14 @@ public final class PtyClient {
 
     public String clientId() {
         return clientId;
+    }
+
+    public String lastOpenedAt() {
+        return lastOpenedAt;
+    }
+
+    public String codexThreadId() {
+        return codexThreadId;
     }
 
     public void sendInput(byte[] bytes) {

@@ -7,6 +7,7 @@ import ctypes
 import datetime as dt
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -15,30 +16,92 @@ import tkinter as tk
 import urllib.error
 import urllib.request
 import uuid
+from collections.abc import Callable
 from ctypes import wintypes
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
+
+DEFAULT_TERMINAL_COLUMNS = 140
+DEFAULT_TERMINAL_ROWS = 42
 
 if __package__ in (None, ""):
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(PROJECT_ROOT))
-    from pc.config import Profile, SettingsStore, TokenStore, data_directory, profile_store
+    from pc.config import (
+        Profile,
+        ProfileStore,
+        SettingsStore,
+        TokenStore,
+        data_directory,
+        move_profile_up,
+        parse_utc_timestamp,
+        pin_profile,
+        sort_profiles_by_recent,
+        unpin_profile,
+    )
     from pc.runtime import (
-        HotKeyListener, SingleInstance, configure_logging, find_cloudflared,
-        install_startup, port_available, write_process_record,
+        HotKeyListener,
+        SingleInstance,
+        configure_logging,
+        find_cloudflared,
+        install_startup,
+        port_available,
+        write_process_record,
     )
     from pc.tunnel import QuickTunnel
     from pc.ui_theme import Tooltip, apply_theme, enable_dpi_awareness, glyph, icon_font
+    from pc.drain_switch import (
+        BRIDGE_GENERATION,
+        DrainStateStore,
+        SHADOW_PROFILE_NAME,
+        find_available_port,
+        merge_session_snapshots,
+        port_is_free,
+        prepare_shadow_catalog,
+        probe_bridge,
+        process_parent_id,
+        terminate_drained_bridge,
+        terminate_legacy_agent,
+    )
 else:
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
-    from .config import Profile, SettingsStore, TokenStore, data_directory, profile_store
+    from .config import (
+        Profile,
+        ProfileStore,
+        SettingsStore,
+        TokenStore,
+        data_directory,
+        move_profile_up,
+        parse_utc_timestamp,
+        pin_profile,
+        sort_profiles_by_recent,
+        unpin_profile,
+    )
     from .runtime import (
-        HotKeyListener, SingleInstance, configure_logging, find_cloudflared,
-        install_startup, port_available, write_process_record,
+        HotKeyListener,
+        SingleInstance,
+        configure_logging,
+        find_cloudflared,
+        install_startup,
+        port_available,
+        write_process_record,
     )
     from .tunnel import QuickTunnel
     from .ui_theme import Tooltip, apply_theme, enable_dpi_awareness, glyph, icon_font
+    from .drain_switch import (
+        BRIDGE_GENERATION,
+        DrainStateStore,
+        SHADOW_PROFILE_NAME,
+        find_available_port,
+        merge_session_snapshots,
+        port_is_free,
+        prepare_shadow_catalog,
+        probe_bridge,
+        process_parent_id,
+        terminate_drained_bridge,
+        terminate_legacy_agent,
+    )
 
 
 def format_activity(value: object, now: dt.datetime | None = None) -> str:
@@ -64,17 +127,65 @@ def format_activity(value: object, now: dt.datetime | None = None) -> str:
     return parsed.strftime("%m-%d %H:%M")
 
 
-def profile_display_state(profile: Profile, session: dict[str, object] | None) -> tuple[str, str]:
+def codex_binding_text(value: dict[str, object] | None) -> str:
+    if not isinstance(value, dict):
+        return "未读取"
+    binding = value.get("binding") if isinstance(value.get("binding"), dict) else {}
+    mode = str(binding.get("mode", value.get("mode", "auto")))
+    if mode == "auto":
+        selected = str(value.get("selectedThreadId") or "")
+        return "自动选择" + (f" · {selected[:8]}" if selected else "")
+    thread_id = str(binding.get("threadId") or "")
+    status = str(binding.get("status", "valid"))
+    labels = {"valid": "已锁定", "archived": "锁定已归档", "missing": "锁定已失效"}
+    return f"{labels.get(status, '已锁定')} · {thread_id[:8]}"
+
+
+def profile_display_state(
+    profile: Profile,
+    session: dict[str, object] | None,
+    last_opened_at: object | None = None,
+) -> tuple[str, str]:
     """Map a profile/session pair to the fixed user-facing state vocabulary."""
+    activity = last_opened_at
+    if activity in (None, "", "-") and session:
+        activity = session.get("lastOpenedAt")
     if not profile.enabled:
-        return "已禁用", "-"
+        return "已禁用", format_activity(activity)
     if not session:
-        return "未运行", "-"
-    if bool(session.get("running")):
-        state = "桌面已连接" if bool(session.get("desktopConnected")) else "运行中"
+        return "未运行", format_activity(activity)
+    if bool(session.get("draining")) and bool(session.get("running")):
+        return "旧版排空中", format_activity(activity)
+    if str(session.get("state", "")).lower() == "exited" or session.get("ended") is True:
+        state = "已退出"
+    elif bool(session.get("running")):
+        if bool(session.get("desktopConnected")):
+            state = "桌面已连接"
+        elif str(session.get("desktopState", "")).lower() == "closed":
+            state = "终端已关闭"
+        else:
+            state = "运行中"
     else:
         state = "已退出"
-    return state, format_activity(session.get("lastActivityAt"))
+    return state, format_activity(activity)
+
+
+def sort_profiles_recent(profiles: list[Profile], recent_activity: dict[str, object] | None = None) -> list[Profile]:
+    """PC-facing alias for the shared stable recent-open ordering."""
+    return sort_profiles_by_recent(profiles, recent_activity)
+
+
+def profile_menu_availability(profiles: list[Profile], profile_id: str) -> dict[str, bool]:
+    """Return context-menu states without requiring a Tk display."""
+    target = next((item for item in profiles if item.id == profile_id), None)
+    first_pinned = next((item for item in profiles if item.pinned), None)
+    return {
+        "move_up": bool(target and (
+            not target.pinned or first_pinned is None or target.id != first_pinned.id
+        )),
+        "pin": target is not None,
+        "unpin": bool(target and target.pinned),
+    }
 
 
 def _terminal_window_titles(profile: Profile) -> tuple[str, ...]:
@@ -299,23 +410,39 @@ def button_availability(
 
 
 class Agent:
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(
+        self, root: tk.Tk, *, sidecar: bool = False,
+        promote_callback: Callable[[], bool] | None = None,
+    ) -> None:
         self.root = root
+        self.sidecar = bool(sidecar)
+        self.promote_callback = promote_callback
+        self._promotion_pending = False
+        self._promote_after_start = False
         self.root.withdraw()
         self.root.title("RelayTerm 启动器")
         self.settings_store = SettingsStore()
         self.settings = self.settings_store.load()
-        self.settings_store.save(self.settings)
         self.token = TokenStore().load_or_create()
-        self.store = profile_store(str(PROJECT_ROOT))
-        self.profiles = self.store.load()
         self.logger = configure_logging(self.token)
         self.host = str(self.settings["host"])
         self.port = int(self.settings["port"])
+        self.port_notice = ""
+        self.standard_profile_path = data_directory() / "profiles.json"
+        self.drain_store = DrainStateStore()
+        self.drain_state = self.drain_store.load()
+        self.drain_bridges: list[dict[str, object]] = []
+        self._initial_drain_snapshots: list[tuple[str, list[dict[str, object]]]] = []
+        profile_path = self._prepare_bridge_topology()
+        self.settings_store.save(self.settings)
+        self.store = ProfileStore(profile_path, str(PROJECT_ROOT))
+        loaded_profiles = self.store.load()
+        self.recent_activity = self.store.recent_activity.load()
+        self.catalog_profiles = loaded_profiles
+        self.profiles = sort_profiles_by_recent(loaded_profiles, self.recent_activity)
         self.bridge: subprocess.Popen[str] | None = None
         self.tunnel: QuickTunnel | None = None
         self.bridge_state = "starting"
-        self.port_notice = ""
         self.tunnel_state = "stopped"
         self.tunnel_url = ""
         self.pairing_url = ""
@@ -323,7 +450,11 @@ class Agent:
         self.pairing_dialog: tk.Toplevel | None = None
         self._pairing_fetching = False
         self._status_fetching = False
-        self.sessions: dict[str, dict[str, object]] = {}
+        self.sessions, self.session_routes = merge_session_snapshots(
+            [], self._initial_drain_snapshots,
+        )
+        self.codex_details: dict[str, dict[str, object]] = {}
+        self._codex_detail_fetching: set[str] = set()
         self.panel: tk.Toplevel | None = None
         self.search_var = tk.StringVar()
         self.search_entry: ttk.Entry | None = None
@@ -339,6 +470,7 @@ class Agent:
         self.delete_button: ttk.Button | None = None
         self.stop_button: ttk.Button | None = None
         self.open_button: ttk.Button | None = None
+        self.profile_menu: tk.Menu | None = None
         self.icon_font = icon_font(root)
         try:
             style = ttk.Style(root)
@@ -347,8 +479,12 @@ class Agent:
             style.configure("Accent.TButton", font=(self.icon_font[0], self.icon_font[1], "bold"))
         except tk.TclError:
             pass
-        self.hotkey = HotKeyListener(lambda: self.root.after(0, self.show_panel))
+        self.hotkey = HotKeyListener(
+            lambda: self.root.after(0, self.show_panel), "D" if self.sidecar else "R",
+        )
         self.hotkey.start()
+        if self.sidecar and self._promote_after_start:
+            self.root.after(0, self._request_sidecar_promotion)
         if bool(self.settings.get("autoStart", True)) and not os.environ.get("RELAYTERM_NO_STARTUP"):
             try:
                 install_startup(PROJECT_ROOT)
@@ -357,14 +493,163 @@ class Agent:
         self.start_bridge()
         self.root.after(700, self.poll_status)
 
+    def _ready_label(self) -> str:
+        key = "D" if self.sidecar else "R"
+        return f"Bridge 就绪 · Ctrl+Alt+Shift+{key}"
+
+    def _request_sidecar_promotion(self) -> None:
+        if not self.sidecar or self._promotion_pending:
+            return
+        self._promotion_pending = True
+
+        def attempt(remaining: int = 20) -> None:
+            callback = self.promote_callback
+            if callback is not None and callback():
+                self.hotkey.stop()
+                self.hotkey = HotKeyListener(lambda: self.root.after(0, self.show_panel), "R")
+                self.hotkey.start()
+                self.sidecar = False
+                self.settings["host"], self.settings["port"] = self.host, self.port
+                self.settings_store.save(self.settings)
+                self._promotion_pending = False
+                self.status_var.set(self._bridge_status_text(self._ready_label()))
+                return
+            if remaining > 0:
+                self.root.after(250, lambda: attempt(remaining - 1))
+            else:
+                self._promotion_pending = False
+
+        attempt()
+
+    def _prepare_bridge_topology(self) -> Path:
+        primary = self.drain_state.get("primary")
+        if isinstance(primary, dict):
+            self.host = str(primary.get("host", self.host))
+            self.port = int(primary.get("port", self.port))
+            profile_path = Path(str(primary.get("profilePath", "") or ""))
+            if not profile_path.exists():
+                prepare_shadow_catalog(self.standard_profile_path, profile_path)
+            drains = self.drain_state.get("drains", [])
+            self.drain_bridges = [dict(item) for item in drains if isinstance(item, dict)]
+            if not self.drain_bridges:
+                self.settings["host"], self.settings["port"] = self.host, self.port
+            changed = False
+            for item in self.drain_bridges:
+                probe = probe_bridge(
+                    str(item.get("host", self.host)), int(item.get("port", 0)), self.token,
+                )
+                if probe is None:
+                    continue
+                item["pid"] = probe.pid or int(item.get("pid", 0) or 0)
+                profile_ids = [
+                    str(session.get("profileId")) for session in probe.running_sessions
+                    if session.get("profileId")
+                ]
+                if profile_ids != item.get("profileIds"):
+                    item["profileIds"] = profile_ids
+                    item["emptyPolls"] = 0 if profile_ids else int(item.get("emptyPolls", 0) or 0)
+                    changed = True
+                self._initial_drain_snapshots.append(
+                    (probe.base_url, [dict(session) for session in probe.running_sessions]),
+                )
+            if changed:
+                self._save_drain_state()
+            self.port_notice = self._drain_notice()
+            return profile_path
+
+        configured_probe = None
+        if not port_available(self.host, self.port):
+            configured_probe = probe_bridge(self.host, self.port, self.token)
+        if configured_probe is None or configured_probe.generation == BRIDGE_GENERATION:
+            return self.standard_profile_path
+
+        running = [dict(item) for item in configured_probe.running_sessions]
+        if not running:
+            legacy_agent_pid = process_parent_id(configured_probe.pid)
+            if terminate_drained_bridge(
+                configured_probe.host, configured_probe.port, configured_probe.pid,
+            ):
+                if legacy_agent_pid:
+                    terminate_legacy_agent(legacy_agent_pid)
+                self._promote_after_start = self.sidecar
+                return self.standard_profile_path
+
+        shadow_path = data_directory() / SHADOW_PROFILE_NAME
+        prepare_shadow_catalog(
+            self.standard_profile_path, shadow_path, configured_probe.catalog,
+        )
+        next_port = find_available_port(self.host, configured_probe.port + 1, span=1000)
+        if next_port is None:
+            raise RuntimeError("drain_port_unavailable")
+        drain = {
+            "host": configured_probe.host,
+            "port": configured_probe.port,
+            "pid": configured_probe.pid,
+            "agentPid": process_parent_id(configured_probe.pid),
+            "generation": configured_probe.generation,
+            "profileIds": [
+                str(item.get("profileId")) for item in running if item.get("profileId")
+            ],
+            "startedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "emptyPolls": 0,
+        }
+        self.host, self.port = configured_probe.host, next_port
+        self.drain_bridges = [drain]
+        self._initial_drain_snapshots = [(configured_probe.base_url, running)]
+        self.drain_state = {
+            "version": 1,
+            "primary": {
+                "host": self.host,
+                "port": self.port,
+                "pid": 0,
+                "generation": BRIDGE_GENERATION,
+                "profilePath": str(shadow_path),
+            },
+            "drains": self.drain_bridges,
+        }
+        self._save_drain_state()
+        self.port_notice = self._drain_notice()
+        self.logger.info(
+            "bridge drain started old=%s new=%s active_profiles=%s",
+            configured_probe.port, self.port, len(running),
+        )
+        return shadow_path
+
+    def _save_drain_state(self) -> None:
+        primary = self.drain_state.get("primary")
+        if isinstance(primary, dict):
+            primary = dict(primary)
+            primary.update({"host": self.host, "port": self.port})
+            self.drain_state["primary"] = primary
+        self.drain_state["drains"] = [dict(item) for item in self.drain_bridges]
+        self.drain_state = self.drain_store.save(self.drain_state)
+
+    def _drain_notice(self) -> str:
+        if not self.drain_bridges:
+            return ""
+        active = sum(len(item.get("profileIds", [])) for item in self.drain_bridges)
+        ports = ",".join(str(item.get("port")) for item in self.drain_bridges)
+        return f"旧版 {ports} 排空中（{active} 个会话）"
+
     @property
     def base_url(self) -> str:
         return f"http://{self.host}:{self.port}"
 
+    def _profile_base_url(self, profile_id: str) -> str:
+        route = getattr(self, "session_routes", {}).get(str(profile_id))
+        if route:
+            return route
+        return f"http://{getattr(self, 'host', '127.0.0.1')}:{getattr(self, 'port', 18765)}"
+
+    def _profile_host_port(self, profile_id: str) -> tuple[str, int]:
+        parsed = urlsplit(self._profile_base_url(profile_id))
+        return parsed.hostname or self.host, int(parsed.port or self.port)
+
     def api(self, path: str, method: str = "GET", body: dict[str, object] | None = None,
-            authenticated: bool = True, timeout: float = 4) -> tuple[int, dict[str, object]]:
+            authenticated: bool = True, timeout: float = 4,
+            base_url: str | None = None) -> tuple[int, dict[str, object]]:
         data = None if body is None else json.dumps(body).encode("utf-8")
-        request = urllib.request.Request(self.base_url + path, data=data, method=method)
+        request = urllib.request.Request((base_url or self.base_url) + path, data=data, method=method)
         if data is not None:
             request.add_header("Content-Type", "application/json")
         if authenticated:
@@ -381,23 +666,30 @@ class Agent:
 
     def start_bridge(self) -> None:
         if not port_available(self.host, self.port):
-            try:
-                status, _ = self.api("/v1/profiles")
-                if status == 200:
+            existing = probe_bridge(self.host, self.port, self.token)
+            if existing is not None and existing.generation == BRIDGE_GENERATION:
+                try:
+                    status, value = self.api("/v1/profiles")
+                    if status != 200:
+                        raise RuntimeError("catalog_unavailable")
+                    self._merge_catalog_activity(value)
                     self.bridge_state = "ready"
-                    self.status_var.set("Bridge 已连接")
+                    self.status_var.set(self._bridge_status_text("Bridge 已连接"))
                     self.endpoint_var.set(self._endpoint_text())
                     self._set_button_states()
                     return
-            except Exception:
-                pass
+                except Exception:
+                    pass
             original_port = self.port
             for candidate in range(original_port + 1, min(original_port + 101, 65536)):
                 if port_available(self.host, candidate):
                     self.port = candidate
-                    self.settings["port"] = candidate
-                    self.settings_store.save(self.settings)
-                    self.port_notice = f"端口 {original_port} 忙，使用备用端口 {candidate}"
+                    if not self.drain_bridges:
+                        self.settings["port"] = candidate
+                        self.settings_store.save(self.settings)
+                    fallback = f"端口 {original_port} 忙，使用备用端口 {candidate}"
+                    self.port_notice = " · ".join(item for item in (self.port_notice, fallback) if item)
+                    self._save_drain_state()
                     self.endpoint_var.set(self._endpoint_text())
                     self.status_var.set(self.port_notice)
                     break
@@ -412,6 +704,7 @@ class Agent:
             "RELAYTERM_PORT": str(self.port),
             "RELAYTERM_TOKEN": self.token,
             "RELAYTERM_PROFILE_PATH": str(self.store.path),
+            "RELAYTERM_DRAIN_STATE_PATH": str(self.drain_store.path),
             "RELAYTERM_INITIAL_CWD": str(PROJECT_ROOT),
             "PYTHONPATH": str(PROJECT_ROOT) + os.pathsep + environment.get("PYTHONPATH", ""),
         })
@@ -421,6 +714,12 @@ class Agent:
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
             errors="replace", creationflags=flags,
         )
+        primary = self.drain_state.get("primary")
+        if isinstance(primary, dict):
+            primary["pid"] = self.bridge.pid
+            primary["agentPid"] = os.getpid()
+            primary["generation"] = BRIDGE_GENERATION
+            self._save_drain_state()
         write_process_record(os.getpid(), self.bridge.pid)
         threading.Thread(target=self._read_bridge_log, name="relayterm-bridge-log", daemon=True).start()
         threading.Thread(target=self._wait_for_bridge, name="relayterm-bridge-health", daemon=True).start()
@@ -449,10 +748,59 @@ class Agent:
 
     def _bridge_ready(self) -> None:
         self.bridge_state = "ready"
-        self.status_var.set("Bridge 就绪 · Ctrl+Alt+Shift+R")
+        self.status_var.set(self._bridge_status_text(self._ready_label()))
         self.endpoint_var.set(self._endpoint_text())
         self._set_button_states()
+        self._refresh_recent_from_catalog()
         self.refresh_tree()
+
+    def _merge_catalog_activity(self, value: dict[str, object] | None) -> None:
+        """Merge the bridge-authoritative timestamps into the local cache."""
+        if not isinstance(value, dict):
+            return
+        items = value.get("profiles")
+        if not isinstance(items, list):
+            return
+        activity_map = getattr(self, "recent_activity", None)
+        if not isinstance(activity_map, dict):
+            activity_map = {}
+            self.recent_activity = activity_map
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            profile_id = str(item.get("id", "")).strip()
+            if "lastOpenedAt" not in item:
+                continue
+            timestamp = item.get("lastOpenedAt")
+            if not profile_id:
+                continue
+            if parse_utc_timestamp(timestamp) is None:
+                if profile_id in activity_map:
+                    activity_map.pop(profile_id, None)
+                continue
+            current = activity_map.get(profile_id)
+            current_dt = parse_utc_timestamp(current)
+            incoming_dt = parse_utc_timestamp(timestamp)
+            if current_dt is None or (incoming_dt is not None and incoming_dt != current_dt):
+                activity_map[profile_id] = str(timestamp)
+
+    def _refresh_recent_from_catalog(self) -> None:
+        """Fetch catalog activity asynchronously after bridge startup."""
+        if self.bridge_state != "ready":
+            return
+
+        def fetch() -> None:
+            try:
+                status, value = self.api("/v1/profiles")
+                if status == 200:
+                    def complete() -> None:
+                        self._merge_catalog_activity(value)
+                        self.refresh_tree()
+                    self.root.after(0, complete)
+            except Exception:
+                pass
+
+        threading.Thread(target=fetch, name="relayterm-catalog-activity", daemon=True).start()
 
     def _set_bridge_error(self, message: str) -> None:
         self.bridge_state = "error"
@@ -461,15 +809,18 @@ class Agent:
         self.refresh_tree()
 
     def _endpoint_text(self) -> str:
-        suffix = " · 备用端口" if self.port_notice else ""
-        return f"{self.host}:{self.port}{suffix}"
+        return f"{self.host}:{self.port}" + (f" · {self.port_notice}" if self.port_notice else "")
+
+    def _bridge_status_text(self, base: str) -> str:
+        notice = self._drain_notice()
+        return base + (f" · {notice}" if notice else "")
 
     def _show_transient_status(self, message: str) -> None:
         self.status_var.set(message)
 
         def restore() -> None:
             if self.status_var.get() == message and self.bridge_state == "ready":
-                self.status_var.set("Bridge 就绪 · Ctrl+Alt+Shift+R")
+                self.status_var.set(self._bridge_status_text(self._ready_label()))
 
         self.root.after(2500, restore)
 
@@ -540,7 +891,7 @@ class Agent:
         self.tree = tree
         tree.heading("name", text="项目名称", anchor="w")
         tree.heading("state", text="状态")
-        tree.heading("activity", text="最近活动")
+        tree.heading("activity", text="最近打开")
         tree.column("name", width=440, minwidth=220, anchor="w", stretch=True)
         tree.column("state", width=116, minwidth=108, anchor="center", stretch=False)
         tree.column("activity", width=138, minwidth=126, anchor="center", stretch=False)
@@ -551,6 +902,14 @@ class Agent:
         tree.bind("<<TreeviewSelect>>", self._selection_changed)
         tree.bind("<Return>", self._start_selected_event)
         tree.bind("<Double-1>", lambda _event: self.start_selected())
+        tree.bind("<Button-3>", self._show_profile_menu)
+        profile_menu = tk.Menu(panel, tearoff=False)
+        profile_menu.add_command(label="上移一格", command=lambda: self._reorder_selected("move_up"))
+        profile_menu.add_command(label="置顶", command=lambda: self._reorder_selected("pin"))
+        profile_menu.add_command(label="取消置顶", command=lambda: self._reorder_selected("unpin"))
+        profile_menu.add_separator()
+        profile_menu.add_command(label="Codex 会话…", command=self.show_codex_sessions)
+        self.profile_menu = profile_menu
 
         ttk.Separator(body, orient="horizontal").grid(row=2, column=0, sticky="ew", pady=(10, 0))
         self.detail_frame = ttk.Frame(body, padding=(0, 9, 0, 2))
@@ -577,7 +936,10 @@ class Agent:
     def _build_detail(self, frame: ttk.Frame) -> None:
         self.detail_vars: dict[str, tk.StringVar] = {
             key: tk.StringVar(value="-")
-            for key in ("directory", "command", "shell", "enabled", "order", "pid", "cwd", "controller", "connections", "state")
+            for key in (
+                "directory", "command", "shell", "enabled", "pid", "cwd", "controller",
+                "connections", "state", "codex",
+            )
         }
         ttk.Label(frame, text="选中项目详情", style="Section.TLabel").grid(
             row=0, column=0, columnspan=4, sticky="w", pady=(0, 5),
@@ -590,9 +952,9 @@ class Agent:
         self.detail_command.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(4, 0))
         meta = ttk.Frame(frame)
         meta.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(7, 0))
-        for column in (1, 3, 5):
+        for column in (1, 3):
             meta.columnconfigure(column, weight=1)
-        for column, (label, key) in enumerate((("Shell", "shell"), ("启用状态", "enabled"), ("排序", "order"))):
+        for column, (label, key) in enumerate((("Shell", "shell"), ("启用状态", "enabled"))):
             base = column * 2
             ttk.Label(meta, text=label, style="Muted.TLabel").grid(row=0, column=base, sticky="w", padx=(0, 6))
             ttk.Label(meta, textvariable=self.detail_vars[key]).grid(row=0, column=base + 1, sticky="w", padx=(0, 18))
@@ -608,6 +970,11 @@ class Agent:
         ttk.Label(frame, text="当前 cwd", style="Muted.TLabel").grid(row=5, column=0, sticky="nw", pady=(5, 0), padx=(0, 10))
         self.detail_cwd = ttk.Entry(frame, textvariable=self.detail_vars["cwd"], state="readonly")
         self.detail_cwd.grid(row=5, column=1, columnspan=3, sticky="ew", pady=(5, 0))
+        ttk.Label(frame, text="Codex 会话", style="Muted.TLabel").grid(
+            row=6, column=0, sticky="nw", pady=(5, 0), padx=(0, 10),
+        )
+        self.detail_codex = ttk.Entry(frame, textvariable=self.detail_vars["codex"], state="readonly")
+        self.detail_codex.grid(row=6, column=1, columnspan=3, sticky="ew", pady=(5, 0))
 
     def _set_search_placeholder(self) -> None:
         if self.search_entry is None or self.search_var.get():
@@ -654,7 +1021,11 @@ class Agent:
         if self.panel is None or not self.panel.winfo_exists():
             self.build_panel()
         assert self.panel is not None
-        self.profiles = self.store.load()
+        loaded_profiles = self.store.load()
+        recent_store = getattr(self.store, "recent_activity", None)
+        self.recent_activity = recent_store.load() if recent_store is not None else {}
+        self.catalog_profiles = loaded_profiles
+        self.profiles = sort_profiles_by_recent(loaded_profiles, self.recent_activity)
         self.refresh_tree()
         self.panel.deiconify()
         self.panel.lift()
@@ -675,12 +1046,17 @@ class Agent:
             self.panel.withdraw()
 
     def profile_state(self, profile: Profile) -> tuple[str, str]:
-        return profile_display_state(profile, self.sessions.get(profile.id))
+        activity = getattr(self, "recent_activity", {})
+        return profile_display_state(profile, self.sessions.get(profile.id), activity.get(profile.id))
 
     def refresh_tree(self) -> None:
         if self.tree is None:
             return
         selected = self.selected_profile_id()
+        # Re-sort on every catalog/status/search refresh.  Selection is tracked
+        # by profile ID below, so a reorder never starts a second connection.
+        catalog_profiles = getattr(self, "catalog_profiles", self.profiles)
+        self.profiles = sort_profiles_by_recent(catalog_profiles, getattr(self, "recent_activity", {}))
         self.tree.delete(*self.tree.get_children())
         query = self._search_query().casefold()
         for profile in self.profiles:
@@ -712,16 +1088,61 @@ class Agent:
         controller_type = str(controller.get("clientType", "")) if controller else "无"
         controller_type = {"desktop": "桌面", "android": "Android"}.get(controller_type, controller_type or "无")
         self.detail_vars["directory"].set(profile.working_directory)
-        self.detail_vars["command"].set(profile.startup_command or "（无）")
+        if profile.launch_mode == "codex":
+            args = " ".join(profile.codex_args)
+            self.detail_vars["command"].set("Codex resume" + (" · " + args if args else ""))
+            self.detail_vars["codex"].set(codex_binding_text(
+                getattr(self, "codex_details", {}).get(profile.id),
+            ))
+        else:
+            self.detail_vars["command"].set(profile.startup_command or "（无）")
+            self.detail_vars["codex"].set("自定义命令")
         self.detail_vars["shell"].set(profile.shell)
         self.detail_vars["enabled"].set("已启用" if profile.enabled else "已禁用")
-        self.detail_vars["order"].set(str(profile.order))
         self.detail_vars["state"].set(state)
         self.detail_vars["pid"].set(str(session.get("pid") or "-"))
         self.detail_vars["cwd"].set(str(session.get("cwd") or profile.working_directory))
         self.detail_vars["controller"].set(controller_type)
         self.detail_vars["connections"].set(str(session.get("attachmentCount", 0)))
         self._set_button_states()
+        if (
+            profile.launch_mode == "codex"
+            and profile.id not in getattr(self, "codex_details", {})
+            and self.bridge_state == "ready"
+            and hasattr(self, "token")
+        ):
+            self._fetch_codex_detail(profile)
+
+    def _fetch_codex_detail(self, profile: Profile) -> None:
+        fetching = getattr(self, "_codex_detail_fetching", None)
+        if fetching is None:
+            fetching = set()
+            self._codex_detail_fetching = fetching
+        if profile.id in fetching:
+            return
+        fetching.add(profile.id)
+
+        def fetch() -> None:
+            value: dict[str, object] | None = None
+            try:
+                status, response = self.api(
+                    self._codex_api_path(profile, "codex-sessions"), timeout=12,
+                )
+                if status == 200:
+                    value = response
+            except Exception:
+                pass
+
+            def complete() -> None:
+                self._codex_detail_fetching.discard(profile.id)
+                if value is not None:
+                    self.codex_details[profile.id] = value
+                    if self.detail_profile_id == profile.id:
+                        self._selection_changed()
+
+            self.root.after(0, complete)
+
+        threading.Thread(target=fetch, name="relayterm-codex-detail", daemon=True).start()
 
     def _set_button_states(self) -> None:
         profile = self.selected_profile() if self.tree is not None else None
@@ -741,6 +1162,58 @@ class Agent:
         profile_id = self.selected_profile_id()
         return next((item for item in self.profiles if item.id == profile_id), None)
 
+    def _show_profile_menu(self, event: tk.Event):
+        if self.tree is None or self.profile_menu is None:
+            return "break"
+        profile_id = self.tree.identify_row(event.y)
+        if not profile_id:
+            return "break"
+        self.tree.selection_set(profile_id)
+        self.tree.focus(profile_id)
+        self._selection_changed()
+        catalog = list(getattr(self, "catalog_profiles", self.profiles))
+        states = profile_menu_availability(catalog, profile_id)
+        for index, key in enumerate(("move_up", "pin", "unpin")):
+            self.profile_menu.entryconfigure(index, state="normal" if states[key] else "disabled")
+        profile = next((item for item in catalog if item.id == profile_id), None)
+        self.profile_menu.entryconfigure(
+            4,
+            state="normal" if profile is not None and profile.launch_mode == "codex"
+            and self.bridge_state == "ready" else "disabled",
+        )
+        try:
+            self.profile_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.profile_menu.grab_release()
+        return "break"
+
+    def _reorder_selected(self, action: str) -> None:
+        profile_id = self.selected_profile_id()
+        if not profile_id:
+            return
+        catalog = self.store.load()
+        operations = {
+            "move_up": move_profile_up,
+            "pin": pin_profile,
+            "unpin": unpin_profile,
+        }
+        operation = operations.get(action)
+        if operation is None:
+            raise ValueError("profile_reorder_action_invalid")
+        self.catalog_profiles = self.store.save(operation(catalog, profile_id))
+        self.profiles = sort_profiles_by_recent(
+            self.catalog_profiles, getattr(self, "recent_activity", {}),
+        )
+        self.search_placeholder_active = False
+        self.search_var.set("")
+        if self.search_entry is not None:
+            self.search_entry.configure(style="Search.TEntry")
+        self.refresh_tree()
+        if self.tree is not None and self.tree.exists(profile_id):
+            self.tree.selection_set(profile_id)
+            self.tree.focus(profile_id)
+            self._selection_changed()
+
     def edit_selected(self) -> None:
         profile = self.selected_profile()
         if profile is not None:
@@ -758,7 +1231,10 @@ class Agent:
             "directory": tk.StringVar(value=existing.working_directory if existing else str(PROJECT_ROOT)),
             "shell": tk.StringVar(value=existing.shell if existing else "pwsh"),
             "command": tk.StringVar(value=existing.startup_command if existing else ""),
-            "order": tk.IntVar(value=existing.order if existing else len(self.profiles)),
+            "launch_mode": tk.StringVar(value=existing.launch_mode if existing else "codex"),
+            "codex_args": tk.StringVar(
+                value=shlex.join(existing.codex_args) if existing and existing.codex_args else "",
+            ),
             "enabled": tk.BooleanVar(value=existing.enabled if existing else True),
         }
         form = ttk.Frame(dialog, padding=(18, 16, 18, 10))
@@ -780,19 +1256,40 @@ class Agent:
         ttk.Button(directory_frame, text="浏览...", command=lambda: self.choose_directory(values["directory"], dialog)).grid(
             row=0, column=1, padx=(8, 0),
         )
-        row_label(2, "启动命令")
-        ttk.Entry(form, textvariable=values["command"]).grid(row=2, column=1, sticky="ew", pady=6)
-        row_label(3, "Shell")
+        row_label(2, "启动方式")
+        mode_frame = ttk.Frame(form)
+        mode_frame.grid(row=2, column=1, sticky="w", pady=6)
+        command_label = ttk.Label(form, text="自定义命令")
+        command_entry = ttk.Entry(form, textvariable=values["command"])
+        codex_label = ttk.Label(form, text="Codex 参数")
+        codex_entry = ttk.Entry(form, textvariable=values["codex_args"])
+
+        def mode_changed() -> None:
+            for widget in (command_label, command_entry, codex_label, codex_entry):
+                widget.grid_remove()
+            if values["launch_mode"].get() == "codex":
+                codex_label.grid(row=3, column=0, sticky="w", padx=(0, 12), pady=6)
+                codex_entry.grid(row=3, column=1, sticky="ew", pady=6)
+            else:
+                command_label.grid(row=3, column=0, sticky="w", padx=(0, 12), pady=6)
+                command_entry.grid(row=3, column=1, sticky="ew", pady=6)
+
+        ttk.Radiobutton(
+            mode_frame, text="Codex 会话", value="codex", variable=values["launch_mode"],
+            command=mode_changed,
+        ).pack(side="left")
+        ttk.Radiobutton(
+            mode_frame, text="自定义命令", value="command", variable=values["launch_mode"],
+            command=mode_changed,
+        ).pack(side="left", padx=(12, 0))
+        row_label(4, "Shell")
         ttk.Combobox(
             form, textvariable=values["shell"], values=("pwsh", "powershell", "cmd", "wsl"), state="readonly",
-        ).grid(row=3, column=1, sticky="w", pady=6)
-        row_label(4, "排序")
-        ttk.Spinbox(form, from_=-1000000, to=1000000, textvariable=values["order"], width=12).grid(
-            row=4, column=1, sticky="w", pady=6,
-        )
+        ).grid(row=4, column=1, sticky="w", pady=6)
         ttk.Checkbutton(form, text="启用", variable=values["enabled"]).grid(row=5, column=1, sticky="w", pady=(3, 6))
         actions = ttk.Frame(form)
         actions.grid(row=6, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        mode_changed()
 
         def save() -> None:
             try:
@@ -801,12 +1298,29 @@ class Agent:
                     "name": values["name"].get(),
                     "workingDirectory": values["directory"].get(),
                     "shell": values["shell"].get(),
-                    "startupCommand": values["command"].get(),
-                    "order": values["order"].get(),
+                    "startupCommand": (
+                        values["command"].get() if values["launch_mode"].get() == "command" else ""
+                    ),
+                    "launchMode": values["launch_mode"].get(),
+                    "codexArgs": (
+                        shlex.split(values["codex_args"].get())
+                        if values["launch_mode"].get() == "codex" and values["codex_args"].get().strip()
+                        else []
+                    ),
+                    "pinned": existing.pinned if existing else False,
                     "enabled": values["enabled"].get(),
                 })
-                profiles = [item for item in self.profiles if item.id != profile.id] + [profile]
-                self.profiles = self.store.save(profiles)
+                cached_profiles = getattr(self, "catalog_profiles", None)
+                profiles = list(cached_profiles if cached_profiles is not None else self.store.load())
+                index = next((i for i, item in enumerate(profiles) if item.id == profile.id), -1)
+                if index >= 0:
+                    profiles[index] = profile
+                else:
+                    profiles.append(profile)
+                self.catalog_profiles = self.store.save(profiles)
+                self.profiles = sort_profiles_by_recent(
+                    self.catalog_profiles, getattr(self, "recent_activity", {}),
+                )
                 dialog.destroy()
                 self.refresh_tree()
                 if self.tree is not None and self.tree.exists(profile.id):
@@ -829,6 +1343,194 @@ class Agent:
         if selected:
             variable.set(selected)
 
+    def _codex_api_path(self, profile: Profile, suffix: str) -> str:
+        return f"/v1/profiles/{quote(profile.id, safe='')}/{suffix}"
+
+    def _terminate_for_codex_switch(self, profile: Profile) -> bool:
+        route = self._profile_base_url(profile.id)
+        status, value = self.api(
+            f"/v1/sessions/{quote(profile.id, safe='')}/terminate",
+            "POST", {"force": True, "remove": True}, timeout=8, base_url=route,
+        )
+        if status not in (200, 404):
+            messagebox.showerror(
+                "Codex 会话", str(value.get("message", value.get("error", "停止会话失败"))),
+                parent=self.panel,
+            )
+            return False
+        self.sessions.pop(profile.id, None)
+        return True
+
+    def _confirm_codex_switch(self, profile: Profile, target_thread_id: str) -> bool:
+        session = self.sessions.get(profile.id) or {}
+        if not session.get("running"):
+            return True
+        current = str(session.get("codexThreadId") or "")
+        if current == target_thread_id:
+            return True
+        return messagebox.askyesno(
+            "切换 Codex 会话",
+            "当前 RelayTerm 终端正在运行其他会话。确认后将终止旧终端并打开所选会话。",
+            parent=self.panel,
+        )
+
+    def _apply_codex_binding(
+        self, profile: Profile, mode: str, thread_id: str = "", *, launch_after_switch: bool = True,
+    ) -> bool:
+        session = self.sessions.get(profile.id) or {}
+        switching = bool(
+            mode == "locked" and session.get("running")
+            and str(session.get("codexThreadId") or "") != thread_id
+        )
+        if switching and not self._confirm_codex_switch(profile, thread_id):
+            return False
+        body: dict[str, object] = {"mode": mode}
+        if mode == "locked":
+            body["threadId"] = thread_id
+        status, value = self.api(
+            self._codex_api_path(profile, "codex-binding"), "PUT", body, timeout=10,
+        )
+        if status != 200:
+            messagebox.showerror(
+                "Codex 会话", str(value.get("message", value.get("error", "绑定更新失败"))),
+                parent=self.panel,
+            )
+            return False
+        details = dict(getattr(self, "codex_details", {}).get(profile.id, {}))
+        details["mode"] = mode
+        details["binding"] = value.get("binding", body)
+        getattr(self, "codex_details", {}).update({profile.id: details})
+        if switching:
+            if not self._terminate_for_codex_switch(profile):
+                return False
+            if launch_after_switch:
+                self._launch_profile(profile, fresh=True, codex_thread_id=thread_id)
+        self._selection_changed()
+        return True
+
+    def show_codex_sessions(self, profile: Profile | None = None) -> None:
+        profile = profile or self.selected_profile()
+        if profile is None or profile.launch_mode != "codex":
+            return
+        try:
+            status, value = self.api(
+                self._codex_api_path(profile, "codex-sessions"), timeout=12,
+            )
+        except Exception as exc:
+            messagebox.showerror("Codex 会话", str(exc), parent=self.panel)
+            return
+        if status != 200:
+            messagebox.showerror(
+                "Codex 会话", str(value.get("message", value.get("error", "读取会话失败"))),
+                parent=self.panel,
+            )
+            return
+        if not hasattr(self, "codex_details"):
+            self.codex_details = {}
+        self.codex_details[profile.id] = value
+        self._selection_changed()
+
+        dialog = tk.Toplevel(self.panel or self.root)
+        dialog.title(f"Codex 会话 · {profile.name}")
+        dialog.transient(self.panel or self.root)
+        dialog.grab_set()
+        dialog.geometry("760x430")
+        dialog.minsize(660, 360)
+        body = ttk.Frame(dialog, padding=14)
+        body.grid(row=0, column=0, sticky="nsew")
+        dialog.rowconfigure(0, weight=1)
+        dialog.columnconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(2, weight=1)
+        ttk.Label(body, text=codex_binding_text(value), style="Section.TLabel").grid(
+            row=0, column=0, sticky="w",
+        )
+        current = value.get("currentRelayThread") if isinstance(value.get("currentRelayThread"), dict) else None
+        current_id = str(current.get("id") or "") if current else ""
+        ttk.Label(
+            body,
+            text=("当前 RelayTerm · " + current_id[:8]) if current_id else "当前 RelayTerm · 未运行",
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(3, 8))
+
+        columns = ("title", "source", "directory", "updated", "uuid")
+        tree = ttk.Treeview(body, columns=columns, show="headings", selectmode="browse")
+        for key, title, width in (
+            ("title", "标题", 210), ("source", "来源", 80), ("directory", "目录", 250),
+            ("updated", "更新时间", 100), ("uuid", "UUID", 72),
+        ):
+            tree.heading(key, text=title, anchor="w")
+            tree.column(key, width=width, minwidth=60, stretch=key in ("title", "directory"), anchor="w")
+        tree.grid(row=2, column=0, sticky="nsew")
+        candidates: dict[str, dict[str, object]] = {}
+        tree.insert("", "end", iid="__auto__", values=("自动选择", "", profile.working_directory, "", ""))
+        for group in ("exactCandidates", "repositoryCandidates"):
+            items = value.get(group)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                thread_id = str(item.get("id", ""))
+                if not thread_id:
+                    continue
+                candidates[thread_id] = item
+                tree.insert("", "end", iid=thread_id, values=(
+                    str(item.get("title", "")), str(item.get("source", "")),
+                    str(item.get("cwd", "")), format_activity(item.get("updatedAt")), thread_id[:8],
+                ))
+        binding = value.get("binding") if isinstance(value.get("binding"), dict) else {}
+        selected = str(binding.get("threadId") or "") if binding.get("mode") == "locked" else "__auto__"
+        if not tree.exists(selected):
+            selected = "__auto__"
+        tree.selection_set(selected)
+        tree.focus(selected)
+
+        actions = ttk.Frame(body)
+        actions.grid(row=3, column=0, sticky="e", pady=(10, 0))
+
+        def create_new() -> None:
+            session = self.sessions.get(profile.id) or {}
+            if session.get("running") and not messagebox.askyesno(
+                "新建 Codex 会话",
+                "当前 RelayTerm 终端正在运行。确认后将创建新会话、终止旧终端并重新连接。",
+                parent=dialog,
+            ):
+                return
+            status_code, result = self.api(
+                self._codex_api_path(profile, "codex-sessions"), "POST", {"lock": True}, timeout=12,
+            )
+            if status_code != 201:
+                messagebox.showerror(
+                    "Codex 会话", str(result.get("message", result.get("error", "新建会话失败"))),
+                    parent=dialog,
+                )
+                return
+            thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
+            thread_id = str(thread.get("id") or "")
+            if session.get("running") and not self._terminate_for_codex_switch(profile):
+                return
+            dialog.destroy()
+            self._launch_profile(profile, fresh=bool(session.get("running")), codex_thread_id=thread_id)
+
+        def apply_selection() -> None:
+            selected_ids = tree.selection()
+            if not selected_ids:
+                return
+            thread_id = selected_ids[0]
+            if thread_id == "__auto__":
+                if self._apply_codex_binding(profile, "auto"):
+                    dialog.destroy()
+                return
+            if self._apply_codex_binding(profile, "locked", thread_id):
+                dialog.destroy()
+
+        ttk.Button(actions, text="新建会话", command=create_new).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="取消", command=dialog.destroy).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="应用", style="Accent.TButton", command=apply_selection).pack(side="left")
+        tree.bind("<Double-1>", lambda _event: apply_selection())
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+
     def delete_selected(self) -> None:
         profile = self.selected_profile()
         if profile is None:
@@ -836,7 +1538,16 @@ class Agent:
         if not messagebox.askyesno("删除项目", f"从 RelayTerm 删除“{profile.name}”？", parent=self.panel):
             return
         was_running = bool((self.sessions.get(profile.id) or {}).get("running"))
-        self.profiles = self.store.save(item for item in self.profiles if item.id != profile.id)
+        route = self._profile_base_url(profile.id)
+        catalog = getattr(self, "catalog_profiles", None)
+        if catalog is None:
+            catalog = self.store.load()
+        self.catalog_profiles = self.store.save(item for item in catalog if item.id != profile.id)
+        self.profiles = sort_profiles_by_recent(
+            self.catalog_profiles, getattr(self, "recent_activity", {}),
+        )
+        if isinstance(getattr(self, "recent_activity", None), dict):
+            self.recent_activity.pop(profile.id, None)
         self.refresh_tree()
         if was_running:
 
@@ -846,6 +1557,7 @@ class Agent:
                         f"/v1/sessions/{quote(profile.id, safe='')}/terminate",
                         "POST",
                         {"force": True},
+                        base_url=route,
                     )
                 except Exception as exc:
                     self.logger.warning("failed to terminate deleted profile %s: %s", profile.id, exc)
@@ -890,6 +1602,31 @@ class Agent:
             return
         session = self.sessions.get(profile.id, {})
         fresh = session.get("state") == "exited"
+        if profile.launch_mode == "codex" and not session.get("running"):
+            try:
+                status, value = self.api(
+                    self._codex_api_path(profile, "codex-sessions"), timeout=12,
+                )
+            except Exception as exc:
+                messagebox.showerror("Codex 会话", str(exc), parent=self.panel)
+                return
+            if status != 200:
+                messagebox.showerror(
+                    "Codex 会话", str(value.get("message", value.get("error", "读取会话失败"))),
+                    parent=self.panel,
+                )
+                return
+            if not hasattr(self, "codex_details"):
+                self.codex_details = {}
+            self.codex_details[profile.id] = value
+            if bool(value.get("requiresSelection")):
+                self.show_codex_sessions(profile)
+                return
+        self._launch_profile(profile, fresh=fresh)
+
+    def _launch_profile(
+        self, profile: Profile, *, fresh: bool = False, codex_thread_id: str = "",
+    ) -> None:
         executable = _console_python_executable()
         environment = os.environ.copy()
         environment["PYTHONPATH"] = str(PROJECT_ROOT) + os.pathsep + environment.get("PYTHONPATH", "")
@@ -899,11 +1636,17 @@ class Agent:
             ctypes.windll.user32.GetForegroundWindow() if os.name == "nt" else None
         )
         command = [
-            wt, "-w", "0", "new-tab", "--title", profile.name,
+            wt, "-w", "new", "--size",
+            f"{DEFAULT_TERMINAL_COLUMNS},{DEFAULT_TERMINAL_ROWS}",
+            "new-tab", "--title", profile.name,
             "--suppressApplicationTitle",
             "--startingDirectory", profile.working_directory,
             executable, "-m", "pc.attach_cli", "--profile-id", profile.id,
         ]
+        route_host, route_port = self._profile_host_port(profile.id)
+        command.extend(("--host", route_host, "--port", str(route_port)))
+        if codex_thread_id:
+            command.extend(("--codex-thread-id", codex_thread_id))
         if fresh:
             command.append("--fresh")
         try:
@@ -921,8 +1664,10 @@ class Agent:
 
         def stop() -> None:
             try:
+                route = self._profile_base_url(profile.id)
                 status, value = self.api(
-                    f"/v1/sessions/{quote(profile.id, safe='')}/terminate", "POST", {"force": True}
+                    f"/v1/sessions/{quote(profile.id, safe='')}/terminate", "POST", {"force": True},
+                    base_url=route,
                 )
                 message = "项目已停止" if status == 200 else str(value.get("error", "项目未运行"))
             except Exception as exc:
@@ -938,22 +1683,114 @@ class Agent:
         self.root.after(2500, self.poll_status)
 
     def _fetch_status(self) -> None:
-        sessions: dict[str, dict[str, object]] | None = None
+        primary_sessions: list[dict[str, object]] | None = None
+        drain_snapshots: list[tuple[str, list[dict[str, object]]]] = []
+        catalog: dict[str, object] | None = None
         try:
             status, value = self.api("/v1/sessions")
             if status == 200:
                 values = value.get("sessions", [])
-                sessions = {
-                    str(item.get("profileId")): item for item in values
-                    if isinstance(item, dict) and item.get("profileId")
-                }
+                primary_sessions = [dict(item) for item in values if isinstance(item, dict)]
+        except Exception:
+            pass
+        updated_drains: list[dict[str, object]] = []
+        for raw_entry in list(getattr(self, "drain_bridges", [])):
+            entry = dict(raw_entry)
+            host, port = str(entry.get("host", self.host)), int(entry.get("port", 0))
+            base_url = f"http://{host}:{port}"
+            values: list[dict[str, object]] | None = None
+            try:
+                status, response = self.api("/v1/sessions", timeout=2, base_url=base_url)
+                if status == 200 and isinstance(response.get("sessions"), list):
+                    values = [
+                        dict(item) for item in response["sessions"] if isinstance(item, dict)
+                    ]
+            except Exception:
+                pass
+            if values is None:
+                if port_is_free(host, port):
+                    self.logger.info("drained bridge disappeared port=%s", port)
+                    continue
+                preserved = [
+                    dict(item) for profile_id, item in self.sessions.items()
+                    if self.session_routes.get(profile_id) == base_url and bool(item.get("running"))
+                ]
+                drain_snapshots.append((base_url, preserved))
+                updated_drains.append(entry)
+                continue
+            running = [item for item in values if bool(item.get("running"))]
+            entry["profileIds"] = [
+                str(item.get("profileId")) for item in running if item.get("profileId")
+            ]
+            entry["emptyPolls"] = 0 if running else int(entry.get("emptyPolls", 0) or 0) + 1
+            if not running and int(entry["emptyPolls"]) >= 3:
+                if terminate_drained_bridge(host, port, int(entry.get("pid", 0) or 0)):
+                    self.logger.info("bridge drain completed port=%s", port)
+                    legacy_agent_pid = int(entry.get("agentPid", 0) or 0)
+                    if legacy_agent_pid:
+                        if terminate_legacy_agent(legacy_agent_pid):
+                            self.logger.info("legacy launcher stopped pid=%s", legacy_agent_pid)
+                        else:
+                            self.logger.warning(
+                                "legacy launcher identity changed pid=%s", legacy_agent_pid,
+                            )
+                    if self.sidecar:
+                        self.root.after(0, self._request_sidecar_promotion)
+                    continue
+            drain_snapshots.append((base_url, values))
+            updated_drains.append(entry)
+
+        self.drain_bridges = updated_drains
+        if not self.drain_bridges:
+            self.settings["host"], self.settings["port"] = self.host, self.port
+            self.settings_store.save(self.settings)
+        if isinstance(self.drain_state.get("primary"), dict):
+            try:
+                self._save_drain_state()
+            except Exception as exc:
+                self.logger.warning("failed to save drain topology: %s", exc)
+        try:
+            status, value = self.api("/v1/profiles")
+            if status == 200:
+                catalog = value
         except Exception:
             pass
 
+        if primary_sessions is None:
+            primary_sessions = [
+                dict(item) for profile_id, item in self.sessions.items()
+                if profile_id not in self.session_routes
+            ]
+        sessions, routes = merge_session_snapshots(primary_sessions, drain_snapshots)
+
         def complete() -> None:
             self._status_fetching = False
+            self.port_notice = self._drain_notice()
+            self.endpoint_var.set(self._endpoint_text())
+            changed = False
+            if catalog is not None:
+                self._merge_catalog_activity(catalog)
+                changed = True
             if sessions is not None:
+                activity_map = getattr(self, "recent_activity", None)
+                if not isinstance(activity_map, dict):
+                    activity_map = {}
+                    self.recent_activity = activity_map
+                for item in sessions.values():
+                    profile_id = str(item.get("profileId", ""))
+                    timestamp = item.get("lastOpenedAt")
+                    if profile_id and parse_utc_timestamp(timestamp) is not None:
+                        current = activity_map.get(profile_id)
+                        current_dt = parse_utc_timestamp(current)
+                        incoming_dt = parse_utc_timestamp(timestamp)
+                        if current_dt is None or (incoming_dt is not None and incoming_dt > current_dt):
+                            activity_map[profile_id] = str(timestamp)
+                    elif profile_id and "lastOpenedAt" in item:
+                        activity_map.pop(profile_id, None)
                 self.sessions = sessions
+                self.session_routes = routes
+                changed = True
+            if changed:
                 self.refresh_tree()
 
         self.root.after(0, complete)
@@ -1169,15 +2006,42 @@ class Agent:
 def main() -> None:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--startup", action="store_true")
-    parser.parse_known_args()
-    instance = SingleInstance()
-    if not instance.acquired:
-        instance.close()
-        return
+    parser.add_argument("--drain-sidecar", action="store_true")
+    arguments, _unknown = parser.parse_known_args()
+    standard_instance = SingleInstance()
+    sidecar = bool(arguments.drain_sidecar)
+    instance = standard_instance
+    standard_holder: list[SingleInstance | None] = [standard_instance if standard_instance.acquired else None]
+    if not standard_instance.acquired:
+        standard_instance.close()
+        standard_holder[0] = None
+        settings = SettingsStore().load()
+        token = TokenStore().load_or_create()
+        existing = probe_bridge(
+            str(settings.get("host", "127.0.0.1")), int(settings.get("port", 18765)), token,
+        )
+        if existing is not None and existing.generation == BRIDGE_GENERATION:
+            return
+        sidecar = True
+        instance = SingleInstance("Local\\RelayTerm.Agent.DrainSwitchV1")
+        if not instance.acquired:
+            instance.close()
+            return
+
+    def promote() -> bool:
+        if standard_holder[0] is not None:
+            return True
+        candidate = SingleInstance()
+        if candidate.acquired:
+            standard_holder[0] = candidate
+            return True
+        candidate.close()
+        return False
+
     enable_dpi_awareness()
     root = tk.Tk()
     apply_theme(root)
-    agent = Agent(root)
+    agent = Agent(root, sidecar=sidecar, promote_callback=promote)
     try:
         root.mainloop()
     finally:
@@ -1186,6 +2050,9 @@ def main() -> None:
         except Exception:
             pass
         instance.close()
+        held = standard_holder[0]
+        if held is not None and held is not instance:
+            held.close()
 
 
 if __name__ == "__main__":

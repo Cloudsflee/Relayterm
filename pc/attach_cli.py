@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import uuid
+from ctypes import wintypes
 from pathlib import Path
 from urllib.parse import quote
 
@@ -21,7 +22,6 @@ else:
     from .config import SettingsStore, TokenStore
 
 import websocket
-
 
 STD_INPUT_HANDLE = -10
 STD_OUTPUT_HANDLE = -11
@@ -40,6 +40,14 @@ SPECIAL_KEYS = {
 INPUT_QUIET_SECONDS = 0.004
 INPUT_MAX_BATCH_SECONDS = 0.025
 MAX_FRAME_BYTES = 64 * 1024
+HEARTBEAT_SECONDS = 5.0
+
+# SetConsoleCtrlHandler event values.  CTRL_C/CTRL_BREAK remain input
+# controls; closing/logoff/shutdown mean that the desktop attachment is gone.
+CTRL_CLOSE_EVENT = 2
+CTRL_LOGOFF_EVENT = 5
+CTRL_SHUTDOWN_EVENT = 6
+TERMINAL_CLOSED_REASON = "terminal_closed"
 
 
 def terminal_size() -> tuple[int, int]:
@@ -56,8 +64,10 @@ class ConsoleMode:
         self.output_mode = ctypes.c_uint()
 
     def __enter__(self):
-        self.kernel32.GetConsoleMode(self.input, ctypes.byref(self.input_mode))
-        self.kernel32.GetConsoleMode(self.output, ctypes.byref(self.output_mode))
+        if not self.kernel32.GetConsoleMode(self.input, ctypes.byref(self.input_mode)):
+            raise OSError("console_input_unavailable")
+        if not self.kernel32.GetConsoleMode(self.output, ctypes.byref(self.output_mode)):
+            raise OSError("console_output_unavailable")
         raw = self.input_mode.value & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT)
         self.kernel32.SetConsoleMode(self.input, raw | ENABLE_VIRTUAL_TERMINAL_INPUT)
         self.kernel32.SetConsoleMode(
@@ -147,9 +157,86 @@ def send_input_batch(stream, value: bytes) -> None:
         send_binary(value[start:])
 
 
-def run(profile_id: str, fresh: bool = False) -> int:
+def send_terminal_closed(stream) -> bool:
+    """Tell the bridge that only the desktop window is closing."""
+    try:
+        return bool(stream.send(json.dumps({
+            "type": "close", "terminate": False, "reason": TERMINAL_CLOSED_REASON,
+        })))
+    except Exception:
+        return False
+
+
+def install_console_close_handler(stream, stop: threading.Event, notify=None):
+    """Register a Windows console lifecycle callback and return an unregisterer."""
+    if os.name != "nt":
+        return lambda: None
+    kernel32 = ctypes.windll.kernel32
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+    def handler(event):
+        if int(event) in (CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT):
+            (notify or (lambda: send_terminal_closed(stream)))()
+            stop.set()
+            return True
+        return False
+
+    # Keep the callback alive for as long as the handler is registered.
+    callback = callback_type(handler)
+    if not kernel32.SetConsoleCtrlHandler(callback, True):
+        return lambda: None
+
+    def unregister() -> None:
+        try:
+            kernel32.SetConsoleCtrlHandler(callback, False)
+        except Exception:
+            pass
+
+    unregister.callback = callback  # type: ignore[attr-defined]
+    return unregister
+
+
+def start_heartbeat(stream, stop: threading.Event, interval: float = HEARTBEAT_SECONDS) -> threading.Thread:
+    """Send a small JSON ping often enough for bridge liveness detection."""
+    def loop() -> None:
+        while not stop.wait(max(0.25, float(interval))):
+            try:
+                if not stream.send(json.dumps({"type": "ping"})):
+                    stop.set()
+                    return
+            except Exception:
+                stop.set()
+                return
+
+    thread = threading.Thread(target=loop, name="relayterm-attach-heartbeat", daemon=True)
+    thread.start()
+    return thread
+
+
+def build_open_message(
+    profile_id: str, desktop_client_id: str, cols: int, rows: int,
+    *, fresh: bool = False, codex_thread_id: str = "",
+) -> dict[str, object]:
+    value: dict[str, object] = {
+        "type": "open", "profileId": profile_id, "sessionId": profile_id,
+        "clientId": desktop_client_id, "clientType": "desktop",
+        "cols": cols, "rows": rows, "resume": not fresh,
+    }
+    if codex_thread_id:
+        value["codexThreadId"] = codex_thread_id
+    return value
+
+
+def run(
+    profile_id: str,
+    fresh: bool = False,
+    codex_thread_id: str = "",
+    host_override: str = "",
+    port_override: int = 0,
+) -> int:
     settings = SettingsStore().load()
-    host, port = str(settings.get("host", "127.0.0.1")), int(settings.get("port", 18765))
+    host = str(host_override or settings.get("host", "127.0.0.1"))
+    port = int(port_override or settings.get("port", 18765))
     token = TokenStore().load_or_create()
     os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
     try:
@@ -158,13 +245,22 @@ def run(profile_id: str, fresh: bool = False) -> int:
         sys.stderr.write(f"RelayTerm attach failed: {exc}\n")
         return 2
     cols, rows = terminal_size()
-    stream.send(json.dumps({
-        "type": "open", "profileId": profile_id, "sessionId": profile_id,
-        "clientId": client_id(), "clientType": "desktop",
-        "cols": cols, "rows": rows, "resume": not fresh,
-    }))
+    open_message = build_open_message(
+        profile_id, client_id(), cols, rows, fresh=fresh, codex_thread_id=codex_thread_id,
+    )
+    stream.send(json.dumps(open_message))
     stop = threading.Event()
+    terminal_close_sent = threading.Event()
+    shell_exited = threading.Event()
     exit_code = [0]
+
+    def notify_terminal_closed() -> bool:
+        if terminal_close_sent.is_set():
+            return True
+        terminal_close_sent.set()
+        return send_terminal_closed(stream)
+
+    unregister_console_handler = install_console_close_handler(stream, stop, notify_terminal_closed)
 
     def receive() -> None:
         try:
@@ -186,6 +282,7 @@ def run(profile_id: str, fresh: bool = False) -> int:
                     ctypes.windll.kernel32.SetConsoleTitleW(f"RelayTerm - {profile_id} [{role}]")
                 elif kind == "exit":
                     exit_code[0] = int(event.get("code", 0))
+                    shell_exited.set()
                     break
                 elif kind == "error":
                     sys.stderr.write(f"\r\nRelayTerm: {event.get('message', event.get('code', 'error'))}\r\n")
@@ -196,6 +293,7 @@ def run(profile_id: str, fresh: bool = False) -> int:
 
     reader = threading.Thread(target=receive, name="relayterm-attach-recv", daemon=True)
     reader.start()
+    heartbeat = start_heartbeat(stream, stop)
     last_size = (cols, rows)
     try:
         with ConsoleMode():
@@ -214,11 +312,20 @@ def run(profile_id: str, fresh: bool = False) -> int:
         pass
     finally:
         stop.set()
+        # A clean client shutdown is still a desktop-window close.  The
+        # bridge will prioritize a shell exit event when one was already seen.
+        if not shell_exited.is_set() and reader.is_alive():
+            notify_terminal_closed()
+        try:
+            unregister_console_handler()
+        except Exception:
+            pass
         try:
             stream.close()
         except Exception:
             pass
         reader.join(timeout=1)
+        heartbeat.join(timeout=1)
     return exit_code[0]
 
 
@@ -226,8 +333,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Attach Windows Terminal to a RelayTerm project")
     parser.add_argument("--profile-id", required=True)
     parser.add_argument("--fresh", action="store_true")
+    parser.add_argument("--codex-thread-id", default="")
+    parser.add_argument("--host", default="")
+    parser.add_argument("--port", type=int, default=0)
     arguments = parser.parse_args()
-    raise SystemExit(run(arguments.profile_id, arguments.fresh))
+    raise SystemExit(run(
+        arguments.profile_id, arguments.fresh, arguments.codex_thread_id,
+        arguments.host, arguments.port,
+    ))
 
 
 if __name__ == "__main__":

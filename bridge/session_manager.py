@@ -22,6 +22,7 @@ MAX_FRAME_BYTES = 64 * 1024
 MAX_SESSION_ID = 128
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+DESKTOP_ATTACHMENT_TIMEOUT_SECONDS = 15.0
 
 _SIGNAL_ALIASES = {
     "INT": "INT",
@@ -191,6 +192,26 @@ class SessionAttachment:
     _pending_output: list[bytes] = field(default_factory=list, repr=False)
     _pending_output_bytes: int = field(default=0, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    # Monotonic time is used for expiry comparisons; the wall-clock value is
+    # exposed only for diagnostics/status responses.  These fields come after
+    # the legacy optional fields so positional construction remains compatible.
+    last_received_at: float = field(default_factory=time.monotonic)
+    last_received_wall: float = field(default_factory=time.time)
+
+    def touch(self, when: float | None = None) -> None:
+        """Record an inbound client frame without changing PTY activity."""
+        with self._lock:
+            if self.closed:
+                return
+            if when is None:
+                self.last_received_at = time.monotonic()
+                self.last_received_wall = time.time()
+            elif float(when) > 100_000_000:
+                self.last_received_wall = float(when)
+                self.last_received_at = time.monotonic() - max(0.0, time.time() - float(when))
+            else:
+                self.last_received_at = float(when)
+                self.last_received_wall = time.time()
 
     def send_binary(self, value: bytes) -> bool:
         with self._lock:
@@ -282,6 +303,7 @@ class PtySession:
             self.launch_spec = PtyLaunchSpec.legacy(str(startup_command).strip() or "codex", cwd)
         self.startup_command = self.launch_spec.startup_command
         self.profile_id = str(profile_id or "")
+        self.codex_thread_id = str(getattr(self.launch_spec, "codex_thread_id", "") or "")
         self.cwd = os.path.abspath(cwd) if cwd and os.path.isdir(cwd) else os.getcwd()
         self.cols, self.rows = clamp_dimensions(cols, rows)
         self.output_limit = max(MAX_FRAME_BYTES, int(output_limit))
@@ -292,6 +314,9 @@ class PtySession:
         self.last_activity = self.created_at
         self.ended = False
         self.exit_code: Optional[int] = None
+        self.desktop_state = "never"
+        self.desktop_closed_at: float | None = None
+        self.last_opened_at: str | None = None
         self.attachments: dict[str, SessionAttachment] = {}
         self.controller_attachment_id: str | None = None
         self._attachment_generation = 0
@@ -316,6 +341,57 @@ class PtySession:
     def _touch(self) -> None:
         self.last_activity = time.monotonic()
         self.last_activity_wall = time.time()
+
+    def _refresh_desktop_state_locked(self) -> None:
+        active = any(
+            item.client_type == "desktop" and not item.closed
+            for item in self.attachments.values()
+        )
+        if active:
+            self.desktop_state = "connected"
+            self.desktop_closed_at = None
+        elif self.desktop_state == "connected":
+            self.desktop_state = "closed"
+            self.desktop_closed_at = time.time()
+
+    def set_last_opened_at(self, value: str | None) -> None:
+        with self._lock:
+            self.last_opened_at = str(value) if value else None
+
+    def touch_attachment(self, attachment: SessionAttachment) -> bool:
+        """Update an attachment heartbeat only while it is still registered."""
+        with self._lock:
+            current = self.attachments.get(attachment.attachment_id)
+            if current is not attachment or attachment.closed:
+                return False
+        attachment.touch()
+        return True
+
+    def reap_stale_desktop_attachments(self, timeout: float = DESKTOP_ATTACHMENT_TIMEOUT_SECONDS) -> list[str]:
+        """Detach desktop sockets that stopped sending frames.
+
+        Android attachments intentionally do not participate in this expiry;
+        they may remain observers while a phone is backgrounded for minutes.
+        """
+        cutoff = time.monotonic() - max(0.1, float(timeout))
+        wall_cutoff = time.time() - max(0.1, float(timeout))
+        def is_stale(item: SessionAttachment) -> bool:
+            frame_value = item.last_received_at
+            frame_stale = (
+                frame_value < wall_cutoff
+                if frame_value > 100_000_000 else frame_value < cutoff
+            )
+            return frame_stale or item.last_received_wall < wall_cutoff
+
+        with self._lock:
+            stale_items = [
+                item for item in self.attachments.values()
+                if not item.closed and item.client_type == "desktop"
+                and is_stale(item)
+            ]
+        for item in stale_items:
+            self.detach(item, invoke_close=True, reason="heartbeat_timeout")
+        return [item.attachment_id for item in stale_items]
 
     def ensure_started(self) -> None:
         """Start the PTY once, after a transport has had a chance to attach."""
@@ -379,6 +455,14 @@ class PtySession:
             self.ended = True
             self.exit_code = int(code)
             self._touch()
+        startup_error = getattr(self.backend, "startup_error_code", None) if self.backend is not None else None
+        if startup_error is not None:
+            self._broadcast_event({
+                "type": "error",
+                "code": "codex_launch_failed",
+                "message": f"codex resume exited with code {int(startup_error)}",
+                "codexThreadId": self.codex_thread_id,
+            })
         self._broadcast_event({"type": "exit", "code": int(code), "cwd": self.cwd})
 
     def attach(
@@ -419,6 +503,9 @@ class PtySession:
                 attachment_cols, attachment_rows, close_sink, bool(defer_output),
             )
             self.attachments[attachment.attachment_id] = attachment
+            if client_type == "desktop":
+                self.desktop_state = "connected"
+                self.desktop_closed_at = None
             if self.controller_attachment_id is None or previous_controller_replaced:
                 self.controller_attachment_id = attachment.attachment_id
                 self.cols, self.rows = attachment.cols, attachment.rows
@@ -447,21 +534,34 @@ class PtySession:
         self.cols, self.rows = selected.cols, selected.rows
         return selected
 
-    def detach(self, attachment: Optional[SessionAttachment] = None, *, invoke_close: bool = True) -> None:
+    def detach(
+        self,
+        attachment: Optional[SessionAttachment] = None,
+        *,
+        invoke_close: bool = True,
+        reason: str = "",
+    ) -> None:
         changed = False
         fallback: SessionAttachment | None = None
         with self._lock:
             targets = list(self.attachments.values()) if attachment is None else [attachment]
+            removed_desktop = False
             for target in targets:
                 current = self.attachments.pop(target.attachment_id, None)
                 if current is None:
                     continue
+                removed_desktop = removed_desktop or current.client_type == "desktop"
                 current.close(invoke_close)
                 if self.controller_attachment_id == current.attachment_id:
                     changed = True
                     self.controller_attachment_id = None
             if changed:
                 fallback = self._fallback_controller_locked()
+            if removed_desktop and not any(
+                item.client_type == "desktop" and not item.closed for item in self.attachments.values()
+            ):
+                self.desktop_state = "closed"
+                self.desktop_closed_at = time.time()
             self._touch()
             event = self._control_event_locked() if changed else None
         if fallback is not None and self.backend is not None and not self.ended:
@@ -489,6 +589,7 @@ class PtySession:
     def write_from(self, attachment: SessionAttachment, data: bytes) -> None:
         if len(data) > MAX_FRAME_BYTES:
             raise ValueError("input_too_large")
+        attachment.touch()
         with self._input_lock:
             backend, event = self._claim_control(attachment)
             if event is not None:
@@ -499,6 +600,7 @@ class PtySession:
         # Validate before claiming control. A malformed observer message must
         # not be able to steal the controller role as a side effect.
         value = _normalise_signal(name)
+        attachment.touch()
         with self._input_lock:
             backend, event = self._claim_control(attachment)
             if event is not None:
@@ -510,6 +612,7 @@ class PtySession:
 
     def resize_from(self, attachment: SessionAttachment, rows: int, cols: int) -> None:
         cols, rows = clamp_dimensions(cols, rows)
+        attachment.touch()
         with self._lock:
             current = self.attachments.get(attachment.attachment_id)
             if current is not attachment:
@@ -564,6 +667,7 @@ class PtySession:
 
     def status(self) -> dict[str, object]:
         with self._lock:
+            self._refresh_desktop_state_locked()
             controller = self.attachments.get(self.controller_attachment_id or "")
             attachments = [
                 {
@@ -572,12 +676,14 @@ class PtySession:
                     "role": "controller" if item is controller else "observer",
                     "cols": item.cols,
                     "rows": item.rows,
+                    "lastReceivedAt": utc_timestamp(item.last_received_wall),
                 }
                 for item in self.attachments.values() if not item.closed
             ]
             return {
                 "sessionId": self.session_id,
                 "profileId": self.profile_id,
+                "codexThreadId": self.codex_thread_id or None,
                 "pid": self.pid,
                 "state": "exited" if self.ended else "running",
                 "running": not self.ended,
@@ -585,7 +691,12 @@ class PtySession:
                 "cwd": self.cwd,
                 "createdAt": utc_timestamp(self.created_wall),
                 "lastActivityAt": utc_timestamp(self.last_activity_wall),
+                "lastOpenedAt": self.last_opened_at,
                 "desktopConnected": any(item["clientType"] == "desktop" for item in attachments),
+                "desktopState": self.desktop_state,
+                "desktopClosedAt": (
+                    utc_timestamp(self.desktop_closed_at) if self.desktop_closed_at is not None else None
+                ),
                 "controller": None if controller is None else {
                     "clientId": controller.client_id,
                     "clientType": controller.client_type,
@@ -598,8 +709,12 @@ class PtySession:
         with self._lock:
             backend = self.backend
             attachments = list(self.attachments.values())
+            had_desktop = any(item.client_type == "desktop" and not item.closed for item in attachments)
             self.attachments.clear()
             self.controller_attachment_id = None
+            if had_desktop:
+                self.desktop_state = "closed"
+                self.desktop_closed_at = time.time()
         for attachment in attachments:
             attachment.close()
         if backend is not None:
@@ -615,11 +730,13 @@ class SessionManager:
         idle_seconds: int = 1800,
         backend_factory: Callable[..., PtyBackend] = spawn_pty,
         output_limit: int = MAX_OUTPUT_BYTES,
+        desktop_timeout_seconds: float = DESKTOP_ATTACHMENT_TIMEOUT_SECONDS,
     ) -> None:
         self.max_sessions = max(1, int(max_sessions))
         self.idle_seconds = max(1, int(idle_seconds))
         self.backend_factory = backend_factory
         self.output_limit = output_limit
+        self.desktop_timeout_seconds = max(0.1, float(desktop_timeout_seconds))
         self.sessions: dict[str, PtySession] = {}
         self._lock = threading.RLock()
         self._stop_reaper = threading.Event()
@@ -627,7 +744,10 @@ class SessionManager:
         self._reaper.start()
 
     def _reap_loop(self) -> None:
-        interval = min(60.0, max(1.0, self.idle_seconds / 2.0))
+        interval = min(
+            60.0,
+            max(0.25, min(self.idle_seconds / 2.0, self.desktop_timeout_seconds / 3.0)),
+        )
         while not self._stop_reaper.wait(interval):
             try:
                 self.reap_idle()
@@ -639,6 +759,7 @@ class SessionManager:
         removed: list[tuple[str, PtySession]] = []
         with self._lock:
             for session_id, session in list(self.sessions.items()):
+                session.reap_stale_desktop_attachments(self.desktop_timeout_seconds)
                 with session._lock:
                     idle = not session.attachments and now - session.last_activity >= self.idle_seconds
                 if idle:
@@ -691,10 +812,16 @@ class SessionManager:
                     return session
         return None
 
-    def list_status(self) -> list[dict[str, object]]:
+    def list_status(self, recent_activity: dict[str, object] | None = None) -> list[dict[str, object]]:
         with self._lock:
             sessions = list(self.sessions.values())
-        return sorted((item.status() for item in sessions), key=lambda item: str(item["lastActivityAt"]), reverse=True)
+        values = [item.status() for item in sessions]
+        if recent_activity is not None:
+            for item in values:
+                profile_id = str(item.get("profileId", ""))
+                if profile_id:
+                    item["lastOpenedAt"] = recent_activity.get(profile_id, item.get("lastOpenedAt"))
+        return sorted(values, key=lambda item: str(item["lastActivityAt"]), reverse=True)
 
     def create_or_resume(self, *args, **kwargs) -> tuple[PtySession, bool]:
         return self.open_session(*args, **kwargs)
@@ -730,6 +857,12 @@ class SessionManager:
             return False
         session.terminate(force)
         return True
+
+    def remove_profile(self, profile_id: str, terminate: bool = True) -> bool:
+        session = self.get_by_profile(profile_id)
+        if session is None:
+            return False
+        return self.remove_instance(session, terminate=terminate)
 
     def remove(self, session_id: str, terminate: bool = True) -> bool:
         with self._lock:

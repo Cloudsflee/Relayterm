@@ -7,6 +7,8 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.IOException;
+import java.net.URLEncoder;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -35,15 +37,26 @@ public final class CatalogClient {
         void onError(String message);
     }
 
+    public interface CodexCallback {
+        void onResult(TerminalProfile profile, JSONObject value);
+        void onError(TerminalProfile profile, String message);
+    }
+
     public static final class PairingResult {
         public final String endpoint;
         public final String token;
         public final JSONArray profiles;
+        public final String revision;
 
-        PairingResult(String endpoint, String token, JSONArray profiles) {
+        public PairingResult(String endpoint, String token, JSONArray profiles) {
+            this(endpoint, token, profiles, "");
+        }
+
+        public PairingResult(String endpoint, String token, JSONArray profiles, String revision) {
             this.endpoint = endpoint;
             this.token = token;
             this.profiles = profiles;
+            this.revision = revision == null ? "" : revision;
         }
     }
 
@@ -81,6 +94,18 @@ public final class CatalogClient {
                         if (session != null) sessions.put(session.optString("profileId", ""), session);
                     }
                 }
+                // The session endpoint is authoritative during the short
+                // window between a ready event and the next catalog refresh.
+                for (int i = 0; i < profiles.size(); i++) {
+                    TerminalProfile profile = profiles.get(i);
+                    JSONObject session = sessions.get(profile.remoteProfileId);
+                    String timestamp = session == null ? "" : session.optString("lastOpenedAt", "");
+                    Instant incoming = TerminalProfile.parseLastOpenedAt(timestamp);
+                    Instant current = TerminalProfile.parseLastOpenedAt(profile.lastOpenedAt);
+                    if (incoming != null && (current == null || incoming.isAfter(current))) {
+                        profiles.set(i, profile.withLastOpenedAt(timestamp));
+                    }
+                }
                 post(operation, () -> callback.onCatalog(connection, profiles, sessions));
             } catch (Exception error) {
                 post(operation, () -> callback.onError(connection, message(error)));
@@ -110,12 +135,75 @@ public final class CatalogClient {
                     JSONObject value = new JSONObject(body);
                     PairingResult result = new PairingResult(
                             value.optString("endpoint", endpoint), value.optString("token", ""),
-                            value.optJSONArray("profiles") == null ? new JSONArray() : value.optJSONArray("profiles"));
+                            value.optJSONArray("profiles") == null ? new JSONArray() : value.optJSONArray("profiles"),
+                            value.optString("revision", ""));
                     if (result.token.isEmpty()) throw new IOException("配对响应缺少 Token");
                     post(operation, () -> callback.onPaired(result));
                 }
             } catch (Exception error) {
                 post(operation, () -> callback.onError(message(error)));
+            }
+        });
+    }
+
+    public void codexSessions(TerminalProfile profile, CodexCallback callback) {
+        codexRequest(profile, "GET", "/v1/profiles/" + segment(profile.remoteProfileId)
+                + "/codex-sessions", null, callback);
+    }
+
+    public void setCodexBinding(
+            TerminalProfile profile, String mode, String threadId, CodexCallback callback) {
+        JSONObject body = new JSONObject();
+        try {
+            body.put("mode", mode);
+            if (threadId != null && !threadId.isEmpty()) body.put("threadId", threadId);
+        } catch (Exception ignored) { }
+        codexRequest(profile, "PUT", "/v1/profiles/" + segment(profile.remoteProfileId)
+                + "/codex-binding", body, callback);
+    }
+
+    public void createCodexSession(TerminalProfile profile, CodexCallback callback) {
+        JSONObject body = new JSONObject();
+        try { body.put("lock", true); } catch (Exception ignored) { }
+        codexRequest(profile, "POST", "/v1/profiles/" + segment(profile.remoteProfileId)
+                + "/codex-sessions", body, callback);
+    }
+
+    public void terminateForCodexSwitch(TerminalProfile profile, CodexCallback callback) {
+        JSONObject body = new JSONObject();
+        try {
+            body.put("force", true);
+            body.put("remove", true);
+        } catch (Exception ignored) { }
+        codexRequest(profile, "POST", "/v1/sessions/" + segment(profile.remoteProfileId)
+                + "/terminate", body, callback);
+    }
+
+    private void codexRequest(
+            TerminalProfile profile, String method, String path, JSONObject body,
+            CodexCallback callback) {
+        long operation = generation.get();
+        executor.execute(() -> {
+            try {
+                RequestBody requestBody = body == null ? null : RequestBody.create(body.toString(), JSON);
+                Request.Builder builder = new Request.Builder()
+                        .url(base(profile.endpoint) + path)
+                        .header("Accept", "application/json");
+                if (!profile.token.isEmpty()) builder.header("Authorization", "Bearer " + profile.token);
+                if ("GET".equals(method)) builder.get();
+                else if ("PUT".equals(method)) builder.put(requestBody);
+                else builder.post(requestBody);
+                try (Response response = http.newCall(builder.build()).execute()) {
+                    String raw = response.body() == null ? "" : response.body().string();
+                    JSONObject value = raw.isEmpty() ? new JSONObject() : new JSONObject(raw);
+                    if (!response.isSuccessful()) {
+                        throw new IOException(value.optString("message",
+                                value.optString("error", "HTTP " + response.code())));
+                    }
+                    post(operation, () -> callback.onResult(profile, value));
+                }
+            } catch (Exception error) {
+                post(operation, () -> callback.onError(profile, message(error)));
             }
         });
     }
@@ -139,6 +227,14 @@ public final class CatalogClient {
 
     private static String base(String endpoint) {
         return endpoint.endsWith("/") ? endpoint.substring(0, endpoint.length() - 1) : endpoint;
+    }
+
+    private static String segment(String value) {
+        try {
+            return URLEncoder.encode(value == null ? "" : value, "UTF-8").replace("+", "%20");
+        } catch (Exception ignored) {
+            return "";
+        }
     }
 
     private static String message(Throwable error) {

@@ -45,6 +45,7 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -89,6 +90,7 @@ public final class MainActivity extends Activity {
     private Button connectButton;
     private Button sendButton;
     private Button stopButton;
+    private ImageButton codexButton;
     private int selectedIndex;
     private String activePtyProfileId = "";
     private String activeLocalProfileId = "";
@@ -113,11 +115,40 @@ public final class MainActivity extends Activity {
 
         @Override
         public void onReady(String profileId, int pid, boolean resumed, String role) {
+            onReady(profileId, pid, resumed, role, "");
+        }
+
+        @Override
+        public void onReady(String profileId, int pid, boolean resumed, String role,
+                             String lastOpenedAt) {
+            onReady(profileId, pid, resumed, role, lastOpenedAt, "");
+        }
+
+        @Override
+        public void onReady(String profileId, int pid, boolean resumed, String role,
+                            String lastOpenedAt, String codexThreadId) {
             readyProfiles.add(profileId);
             endedProfiles.remove(profileId);
             profileErrors.remove(profileId);
             requestedProfiles.add(profileId);
             profileRoles.put(profileId, role);
+            JSONObject session = catalogSessions.get(profileId);
+            if (session == null) session = new JSONObject();
+            try {
+                session.put("profileId", profileId);
+                session.put("running", true);
+                session.put("state", "running");
+                session.put("pid", pid);
+                if (codexThreadId != null && !codexThreadId.isEmpty()) {
+                    session.put("codexThreadId", codexThreadId);
+                }
+                catalogSessions.put(profileId, session);
+            } catch (Exception ignored) { }
+            String activity = lastOpenedAt == null ? "" : lastOpenedAt.trim();
+            if (activity.isEmpty() && isLocallyOwnedProfile(profileId)) {
+                activity = Instant.now().toString();
+            }
+            if (!activity.isEmpty()) applyLastOpenedAt(profileId, activity);
             if (resumed) pendingReplayProfiles.add(profileId);
             else pendingReplayProfiles.remove(profileId);
             resetStopFlow();
@@ -317,6 +348,13 @@ public final class MainActivity extends Activity {
         profileSpinner = new Spinner(this);
         profileSpinner.setBackground(buttonBackground(6));
         switchRow.addView(profileSpinner, new LinearLayout.LayoutParams(0, dp(46), 1));
+        codexButton = iconButton(android.R.drawable.ic_menu_recent_history, "Codex 会话");
+        codexButton.setOnClickListener(v -> {
+            if (!profiles.isEmpty()) requestCodexSessions(profiles.get(selectedIndex));
+        });
+        LinearLayout.LayoutParams codexParams = new LinearLayout.LayoutParams(dp(42), dp(46));
+        codexParams.setMarginStart(dp(6));
+        switchRow.addView(codexButton, codexParams);
         ImageButton edit = iconButton(android.R.drawable.ic_menu_edit, "编辑终端");
         edit.setOnClickListener(v -> { if (!profiles.isEmpty()) showEditor(profiles.get(selectedIndex)); });
         LinearLayout.LayoutParams editParams = new LinearLayout.LayoutParams(dp(42), dp(46));
@@ -519,6 +557,7 @@ public final class MainActivity extends Activity {
         if (profiles.isEmpty()) return;
         TerminalProfile profile = profiles.get(selectedIndex);
         connectButton.setEnabled(true);
+        if (codexButton != null) codexButton.setEnabled(profile.usesCodexSessions());
         if (profile.isLocal()) {
             boolean ready = readyProfiles.contains(profile.id);
             connectButton.setText(ready ? "就绪" : "连接");
@@ -554,13 +593,13 @@ public final class MainActivity extends Activity {
             stopButton.setEnabled(false);
             updateStopButtonStyle(false);
             JSONObject session = catalogSessions.get(profile.id);
-            if (session != null && session.optBoolean("running", false)) {
-                setStatus("运行中 · 未连接", SECONDARY);
-                connectButton.setText("连接");
-            } else if (session != null && "exited".equals(session.optString("state", ""))) {
+            if (session != null && "exited".equalsIgnoreCase(session.optString("state", ""))) {
                 setStatus("已退出", SECONDARY);
                 connectButton.setText("新建");
                 endedProfiles.add(profile.id);
+            } else if (session != null && session.optBoolean("running", false)) {
+                setStatus(TerminalProfile.displaySessionStatus(session, false, "observer"), SECONDARY);
+                connectButton.setText("连接");
             } else {
                 setStatus(requestedProfiles.contains(profile.id) ? "会话已保留" : "未连接", SECONDARY);
             }
@@ -579,6 +618,7 @@ public final class MainActivity extends Activity {
         profileErrors.remove(profile.id);
         if (profile.isLocal()) {
             readyProfiles.add(profile.id);
+            applyLastOpenedAt(profile.id, Instant.now().toString());
             appendSystem(profile.id, "本机演示终端已就绪\r\n");
             updateSelectedState();
             return;
@@ -588,16 +628,208 @@ public final class MainActivity extends Activity {
             resetStopFlow();
             ptyClient.closeSession(true);
         }
+        JSONObject known = catalogSessions.get(profile.id);
+        boolean relayRunning = known != null && known.optBoolean("running", false);
+        if (profile.usesCodexSessions() && !relayRunning) {
+            setStatus("读取 Codex 会话…", SECONDARY);
+            catalogClient.codexSessions(profile, new CatalogClient.CodexCallback() {
+                @Override public void onResult(TerminalProfile selected, JSONObject value) {
+                    if (value.optBoolean("requiresSelection", false)) {
+                        showCodexSessions(selected, value);
+                    } else {
+                        openPty(selected, !createFresh, "");
+                    }
+                }
+                @Override public void onError(TerminalProfile selected, String message) {
+                    profileErrors.put(selected.id, message);
+                    if (isSelected(selected.id)) setStatus(message, DANGER);
+                }
+            });
+            return;
+        }
         openPty(profile, !createFresh);
     }
 
     private void openPty(TerminalProfile profile, boolean resume) {
+        openPty(profile, resume, "");
+    }
+
+    private void openPty(TerminalProfile profile, boolean resume, String codexThreadId) {
         if (!foreground && !isChangingConfigurations()) return;
         resetStopFlow();
         if (!activePtyProfileId.isEmpty() && !activePtyProfileId.equals(profile.id)) ptyClient.disconnect();
         activePtyProfileId = profile.id;
         ptyClient.connect(profile, terminalView.getTerminalColumns(), terminalView.getTerminalRows(),
-                resume, ptyListener);
+                resume, codexThreadId, ptyListener);
+    }
+
+    private void requestCodexSessions(TerminalProfile profile) {
+        if (profile == null || !profile.usesCodexSessions()) return;
+        setStatus("读取 Codex 会话…", SECONDARY);
+        catalogClient.codexSessions(profile, new CatalogClient.CodexCallback() {
+            @Override public void onResult(TerminalProfile selected, JSONObject value) {
+                showCodexSessions(selected, value);
+                if (isSelected(selected.id)) updateSelectedState();
+            }
+            @Override public void onError(TerminalProfile selected, String message) {
+                if (isSelected(selected.id)) setStatus(message, DANGER);
+            }
+        });
+    }
+
+    private JSONObject relaySession(TerminalProfile profile) {
+        return profile == null ? null : catalogSessions.get(profile.id);
+    }
+
+    private boolean relaySessionRunning(TerminalProfile profile) {
+        JSONObject session = relaySession(profile);
+        return session != null && session.optBoolean("running", false);
+    }
+
+    private String currentCodexThread(TerminalProfile profile) {
+        if (profile != null && profile.id.equals(activePtyProfileId)
+                && !ptyClient.codexThreadId().isEmpty()) return ptyClient.codexThreadId();
+        JSONObject session = relaySession(profile);
+        return session == null ? "" : session.optString("codexThreadId", "");
+    }
+
+    private void confirmCodexSwitch(
+            TerminalProfile profile, String targetThreadId, Runnable confirmed) {
+        boolean switching = relaySessionRunning(profile)
+                && !targetThreadId.equals(currentCodexThread(profile));
+        if (!switching) {
+            confirmed.run();
+            return;
+        }
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("切换 Codex 会话？")
+                .setMessage("当前 RelayTerm 终端正在运行其他会话。确认后将终止旧终端并打开所选会话。")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("切换", (ignored, which) -> confirmed.run())
+                .create();
+        dialog.setOnShowListener(ignored -> styleDialog(dialog, true));
+        dialog.show();
+    }
+
+    private void terminateAndOpenCodex(TerminalProfile profile, String threadId) {
+        catalogClient.terminateForCodexSwitch(profile, new CatalogClient.CodexCallback() {
+            @Override public void onResult(TerminalProfile selected, JSONObject value) {
+                resetStopFlow();
+                if (selected.id.equals(activePtyProfileId)) ptyClient.disconnect();
+                activePtyProfileId = "";
+                readyProfiles.remove(selected.id);
+                endedProfiles.remove(selected.id);
+                catalogSessions.remove(selected.id);
+                requestedProfiles.add(selected.id);
+                openPty(selected, false, threadId);
+            }
+            @Override public void onError(TerminalProfile selected, String message) {
+                if (isSelected(selected.id)) setStatus(message, DANGER);
+            }
+        });
+    }
+
+    private void applyCodexBinding(
+            TerminalProfile profile, String mode, String threadId, AlertDialog owner) {
+        boolean switching = "locked".equals(mode) && relaySessionRunning(profile)
+                && !threadId.equals(currentCodexThread(profile));
+        Runnable update = () -> catalogClient.setCodexBinding(
+                profile, mode, threadId, new CatalogClient.CodexCallback() {
+                    @Override public void onResult(TerminalProfile selected, JSONObject value) {
+                        if (owner != null && owner.isShowing()) owner.dismiss();
+                        if (switching) terminateAndOpenCodex(selected, threadId);
+                        else {
+                            toast("Codex 绑定已更新");
+                            if (isSelected(selected.id)) updateSelectedState();
+                        }
+                    }
+                    @Override public void onError(TerminalProfile selected, String message) {
+                        if (isSelected(selected.id)) setStatus(message, DANGER);
+                    }
+                });
+        if (switching) confirmCodexSwitch(profile, threadId, update);
+        else update.run();
+    }
+
+    private void createCodexSession(TerminalProfile profile, AlertDialog owner) {
+        boolean switching = relaySessionRunning(profile);
+        Runnable create = () -> catalogClient.createCodexSession(
+                profile, new CatalogClient.CodexCallback() {
+                    @Override public void onResult(TerminalProfile selected, JSONObject value) {
+                        JSONObject thread = value.optJSONObject("thread");
+                        String threadId = thread == null ? "" : thread.optString("id", "");
+                        if (threadId.isEmpty()) {
+                            if (isSelected(selected.id)) setStatus("新会话响应缺少 UUID", DANGER);
+                            return;
+                        }
+                        if (owner != null && owner.isShowing()) owner.dismiss();
+                        requestedProfiles.add(selected.id);
+                        if (switching) terminateAndOpenCodex(selected, threadId);
+                        else openPty(selected, false, threadId);
+                    }
+                    @Override public void onError(TerminalProfile selected, String message) {
+                        if (isSelected(selected.id)) setStatus(message, DANGER);
+                    }
+                });
+        if (switching) confirmCodexSwitch(profile, "__new__", create);
+        else create.run();
+    }
+
+    private String codexChoiceLabel(JSONObject item) {
+        String kind = "repository".equals(item.optString("matchType")) ? "同仓库" : "当前目录";
+        String updated = item.optString("updatedAt", "");
+        if (updated.length() > 16) updated = updated.substring(0, 16).replace('T', ' ');
+        String meta = item.optString("source", "") + " · "
+                + item.optString("id", "").substring(0,
+                Math.min(8, item.optString("id", "").length()));
+        if (!updated.isEmpty()) meta += " · " + updated;
+        return item.optString("title", "未命名会话") + "\n" + kind + " · " + meta
+                + "\n" + item.optString("cwd", "");
+    }
+
+    private void showCodexSessions(TerminalProfile profile, JSONObject value) {
+        if (profile == null || !profile.usesCodexSessions()) return;
+        List<String> ids = new ArrayList<>();
+        List<String> labels = new ArrayList<>();
+        ids.add("");
+        labels.add("自动选择\n按当前目录选择最近会话");
+        for (String key : new String[]{"exactCandidates", "repositoryCandidates"}) {
+            JSONArray items = value.optJSONArray(key);
+            if (items == null) continue;
+            for (int i = 0; i < items.length(); i++) {
+                JSONObject item = items.optJSONObject(i);
+                if (item == null || item.optString("id", "").isEmpty()) continue;
+                ids.add(item.optString("id", ""));
+                labels.add(codexChoiceLabel(item));
+            }
+        }
+        JSONObject binding = value.optJSONObject("binding");
+        String locked = binding != null && "locked".equals(binding.optString("mode"))
+                ? binding.optString("threadId", "") : "";
+        int initial = Math.max(0, ids.indexOf(locked));
+        int[] selected = {initial};
+        String current = currentCodexThread(profile);
+        String subtitle = current.isEmpty() ? "RelayTerm 未运行"
+                : "RelayTerm 当前 · " + current.substring(0, Math.min(8, current.length()));
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Codex 会话 · " + subtitle)
+                .setSingleChoiceItems(labels.toArray(new String[0]), initial,
+                        (ignored, which) -> selected[0] = which)
+                .setNeutralButton("新建会话", null)
+                .setNegativeButton("取消", null)
+                .setPositiveButton("应用", null)
+                .create();
+        dialog.setOnShowListener(ignored -> {
+            styleDialog(dialog, false);
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(
+                    view -> createCodexSession(profile, dialog));
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+                int index = Math.max(0, Math.min(selected[0], ids.size() - 1));
+                String threadId = ids.get(index);
+                applyCodexBinding(profile, threadId.isEmpty() ? "auto" : "locked", threadId, dialog);
+            });
+        });
+        dialog.show();
     }
 
     private void sendCommand() {
@@ -965,6 +1197,43 @@ public final class MainActivity extends Activity {
         }
         refreshProfileSpinner();
         selectProfile(selectedIndex, false);
+    }
+
+    private boolean isLocallyOwnedProfile(String profileId) {
+        for (TerminalProfile profile : profiles) {
+            if (profile.id.equals(profileId)) return !profile.managed;
+        }
+        return false;
+    }
+
+    /** Apply a successful ready timestamp without changing the active socket. */
+    private void applyLastOpenedAt(String profileId, String timestamp) {
+        if (profileId == null || profileId.isEmpty() || timestamp == null || timestamp.isEmpty()
+                || TerminalProfile.parseLastOpenedAt(timestamp) == null) return;
+        if (store != null) {
+            try {
+                store.updateLastOpenedAt(profileId, timestamp);
+            } catch (RuntimeException ignored) {
+                // A test/legacy store may not implement the optional cache
+                // update; the in-memory profile still reflects the bridge.
+            }
+        }
+        String selectedId = profiles.isEmpty() || selectedIndex < 0 || selectedIndex >= profiles.size()
+                ? "" : profiles.get(selectedIndex).id;
+        for (int i = 0; i < profiles.size(); i++) {
+            if (profiles.get(i).id.equals(profileId)) {
+                profiles.set(i, profiles.get(i).withLastOpenedAt(timestamp));
+                List<TerminalProfile> ordered = TerminalStore.sortProfiles(new ArrayList<>(profiles));
+                profiles.clear();
+                profiles.addAll(ordered);
+                selectedIndex = selectedId.isEmpty() ? findIndexById(profileId) : findIndexById(selectedId);
+                if (profileSpinner != null) {
+                    refreshProfileSpinner();
+                    if (isSelected(profileId)) updateSelectedState();
+                }
+                return;
+            }
+        }
     }
 
     private boolean isCurrentConnection(PcConnection expected) {

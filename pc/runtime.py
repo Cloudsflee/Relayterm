@@ -49,8 +49,10 @@ class SingleInstance:
 
 
 class HotKeyListener:
-    def __init__(self, callback: Callable[[], None]) -> None:
+    def __init__(self, callback: Callable[[], None], key: str = "R") -> None:
         self.callback = callback
+        value = str(key or "R").strip().upper()
+        self.key = value if len(value) == 1 and "A" <= value <= "Z" else "R"
         self.thread: threading.Thread | None = None
         self.thread_id = 0
         self.error = ""
@@ -73,7 +75,7 @@ class HotKeyListener:
                 None,
                 hotkey_id,
                 MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT,
-                ord("R"),
+                ord(self.key),
             )
         )
         if not registered:
@@ -119,7 +121,7 @@ class HotKeyListener:
                         alt_down[0] = True
                     elif vk in (0xA0, 0xA1, 0x10):
                         shift_down[0] = True
-                    elif vk == ord("R") and ctrl_down[0] and alt_down[0] and shift_down[0] and not triggered[0]:
+                    elif vk == ord(self.key) and ctrl_down[0] and alt_down[0] and shift_down[0] and not triggered[0]:
                         triggered[0] = True
                         self.callback()
                 elif w_param in (WM_KEYUP, WM_SYSKEYUP):
@@ -129,7 +131,7 @@ class HotKeyListener:
                         alt_down[0] = False
                     elif vk in (0xA0, 0xA1, 0x10):
                         shift_down[0] = False
-                    elif vk == ord("R"):
+                    elif vk == ord(self.key):
                         triggered[0] = False
             return user32.CallNextHookEx(self._hook, code, w_param, l_param)
 
