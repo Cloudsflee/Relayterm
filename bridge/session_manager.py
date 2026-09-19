@@ -449,6 +449,8 @@ class PtySession:
 
     def on_exit(self, code: int) -> None:
         with self._lock:
+            if self.ended:
+                return
             backend_cwd = getattr(self.backend, "current_cwd", "") if self.backend is not None else ""
             if backend_cwd and os.path.isdir(backend_cwd):
                 self.cwd = os.path.abspath(backend_cwd)
@@ -456,12 +458,14 @@ class PtySession:
             self.exit_code = int(code)
             self._touch()
         startup_error = getattr(self.backend, "startup_error_code", None) if self.backend is not None else None
-        if startup_error is not None:
+        if startup_error is not None or (self.codex_thread_id and code != 0):
             self._broadcast_event({
                 "type": "error",
                 "code": "codex_launch_failed",
-                "message": f"codex resume exited with code {int(startup_error)}",
+                "message": f"Codex 终端已退出（{int(startup_error if startup_error is not None else code)}），"
+                           "错误详情见上方输出。请重新选择会话；如在其他端运行，请先停止后重试。",
                 "codexThreadId": self.codex_thread_id,
+                "fatal": True,
             })
         self._broadcast_event({"type": "exit", "code": int(code), "cwd": self.cwd})
 
@@ -591,10 +595,15 @@ class PtySession:
             raise ValueError("input_too_large")
         attachment.touch()
         with self._input_lock:
+            if self.ended:
+                return  # Late terminal replies/input after exit are discarded.
             backend, event = self._claim_control(attachment)
             if event is not None:
                 self._broadcast_event(event)
-            backend.write(data)
+            try:
+                backend.write(data)
+            except EOFError:
+                self.on_exit(1)
 
     def signal_from(self, attachment: SessionAttachment, name: str) -> None:
         # Validate before claiming control. A malformed observer message must
@@ -602,6 +611,8 @@ class PtySession:
         value = _normalise_signal(name)
         attachment.touch()
         with self._input_lock:
+            if self.ended:
+                return
             backend, event = self._claim_control(attachment)
             if event is not None:
                 self._broadcast_event(event)

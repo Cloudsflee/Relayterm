@@ -28,6 +28,27 @@ class AiohttpPtyProtocolTest(unittest.IsolatedAsyncioTestCase):
         await self.client.close()
         self.manager.shutdown()
 
+    async def test_failed_codex_keeps_raw_error_and_drops_late_input(self) -> None:
+        ws = await self.client.ws_connect("/v1/pty", headers={"Authorization": "Bearer AIO_TOKEN"})
+        await ws.send_json({"type": "open", "sessionId": "failed-codex"})
+        await ws.receive(timeout=3)
+        await ws.receive(timeout=3)
+        session = self.manager.get("failed-codex")
+        session.codex_thread_id = "019c5a2f-87f6-7db0-babc-2bb3923347a3"
+        original = b"ERROR: No saved session found with ID fixture\r\n"
+        session.on_output(original)
+        session.on_exit(7)
+        self.assertEqual(original, (await ws.receive(timeout=3)).data)
+        error = (await ws.receive(timeout=3)).json()
+        self.assertEqual("codex_launch_failed", error["code"])
+        self.assertTrue(error["fatal"])
+        self.assertEqual(7, (await ws.receive(timeout=3)).json()["code"])
+        for _ in range(10):
+            await ws.send_bytes(b"late terminal reply")
+        await ws.send_json({"type": "ping"})
+        self.assertEqual("pong", (await ws.receive(timeout=3)).json()["type"])
+        await ws.close()
+
     async def test_ready_precedes_synchronous_startup_output(self) -> None:
         websocket = await self.client.ws_connect(
             "/v1/pty?sessionId=aio-order",

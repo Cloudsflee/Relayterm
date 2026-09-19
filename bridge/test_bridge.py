@@ -8,6 +8,7 @@ import unittest
 import urllib.error
 import urllib.request
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer
 
 from bridge import relay_bridge
@@ -51,7 +52,7 @@ class BridgeProtocolTest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertTrue(value["ok"])
         self.assertEqual("relayterm", value["service"])
-        self.assertEqual("codex-color-v2", value["bridgeGeneration"])
+        self.assertEqual(relay_bridge.BRIDGE_GENERATION, value["bridgeGeneration"])
 
     def test_authentication(self) -> None:
         status, body = self.request("/v1/exec", "POST", {"command": "echo no"})
@@ -103,6 +104,28 @@ class BridgeProtocolTest(unittest.TestCase):
                              os.path.normcase(str(listed["cwd"])))
         finally:
             shutil.rmtree(temporary, ignore_errors=True)
+
+    def test_bounded_http_server_reuses_a_fixed_worker_pool(self) -> None:
+        server = relay_bridge.RelayHTTPServer(
+            ("127.0.0.1", 0), relay_bridge.RelayHandler, max_workers=3,
+        )
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+
+        def request_health(_index: int) -> int:
+            with urllib.request.urlopen(base + "/health", timeout=3) as response:
+                return response.status
+
+        try:
+            with ThreadPoolExecutor(max_workers=12) as workers:
+                statuses = list(workers.map(request_health, range(120)))
+            self.assertEqual([200] * 120, statuses)
+            self.assertLessEqual(server._request_executor._max_workers, 3)
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

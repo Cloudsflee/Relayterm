@@ -8,6 +8,7 @@ import textwrap
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from bridge.codex_sessions import (
     AppServerProtocolError,
@@ -110,6 +111,41 @@ class AppServerClientTest(unittest.TestCase):
         finally:
             client.shutdown()
 
+    def test_create_names_and_verifies_thread_before_releasing_it(self) -> None:
+        client = self.client("pages")
+        saved = thread(THREAD_C, self.temp.name, "appServer", 30)
+        with patch.object(client, "request", side_effect=[
+            {"thread": saved}, {}, {"thread": saved}, {},
+        ]) as request:
+            self.assertEqual(THREAD_C, client.start_thread(self.temp.name)["id"])
+        self.assertEqual(
+            ["thread/start", "thread/name/set", "thread/read", "thread/unsubscribe"],
+            [call.args[0] for call in request.call_args_list],
+        )
+        self.assertFalse(request.call_args_list[0].args[1]["ephemeral"])
+        self.assertEqual("legacy", request.call_args_list[0].args[1]["historyMode"])
+        self.assertTrue(request.call_args_list[2].args[1]["includeTurns"])
+        self.assertTrue(request.call_args_list[1].args[1]["name"])
+
+    def test_failed_create_does_not_repeat_allocation_or_return_an_unsaved_uuid(self) -> None:
+        client = self.client("pages")
+        with (
+            patch.object(client, "_ensure_started_locked"),
+            patch.object(client, "_raw_request_locked", side_effect=AppServerTransportError("timeout")) as raw,
+            self.assertRaises(AppServerTransportError),
+        ):
+            client.request("thread/start", {"cwd": self.temp.name})
+        self.assertEqual(1, raw.call_count)
+        with (
+            patch.object(client, "request", side_effect=[
+                {"thread": thread(THREAD_C, self.temp.name, "appServer", 30)},
+                AppServerTransportError("name failed"),
+            ]) as request,
+            self.assertRaises(AppServerTransportError),
+        ):
+            client.start_thread(self.temp.name)
+        self.assertEqual(2, request.call_count)
+
     def test_timeout_and_protocol_error_are_bounded(self) -> None:
         timeout_client = self.client("timeout", timeout=0.15)
         try:
@@ -132,6 +168,11 @@ class FakeClient:
         self.active = list(active or [])
         self.archived = list(archived or [])
         self.started = []
+        self.read_ids = []
+
+    def read_thread(self, thread_id):
+        self.read_ids.append(thread_id)
+        return next((t for t in self.active if t["id"] == thread_id), {})
 
     def list_threads(self, archived=False, **_kwargs):
         return list(self.archived if archived else self.active)
@@ -243,6 +284,20 @@ class SessionServiceTest(unittest.TestCase):
         with self.assertRaises(CodexSessionError) as conflict:
             service.resolve(self.profile, THREAD_B)
         self.assertEqual("codex_thread_conflict", conflict.exception.code)
+
+    def test_resume_checks_fresh_storage_and_preserves_invalid_lock(self) -> None:
+        client = FakeClient([thread(THREAD_A, str(self.project), "cli", 30)])
+        service = self.service(client)
+        self.bindings.set_locked(self.profile.id, THREAD_A)
+        client.read_thread = Mock(side_effect=CodexSessionError("codex_thread_unavailable"))
+        with patch.object(client, "list_threads", wraps=client.list_threads) as listing:
+            with self.assertRaises(CodexSessionError):
+                service.resolve(self.profile)
+        listing.assert_any_call(False, force=True)
+        self.assertEqual(THREAD_A, self.bindings.get(self.profile.id)["threadId"])
+        self.assertEqual([], client.started)
+        with self.assertRaises(CodexSessionError):
+            service.set_binding(self.profile.id, {"mode": "locked", "threadId": THREAD_A})
 
     def test_binding_store_roundtrip_and_shell_quoting(self) -> None:
         saved = self.bindings.set_locked("project", THREAD_A)

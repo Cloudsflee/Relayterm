@@ -10,6 +10,7 @@ optional wheel installed.
 from __future__ import annotations
 
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -265,6 +266,14 @@ class PtyBackend:
         try:
             while not self._closed:
                 if self._using_winpty:
+                    transport = getattr(self._proc, "fileobj", None)
+                    if transport is not None and not select.select([transport], [], [], 0.1)[0]:
+                        # pywinpty's socket can remain open after the child exits.
+                        # Poll liveness between reads instead of waiting for user
+                        # input to reveal that the PTY is already dead.
+                        if not self.is_alive():
+                            break
+                        continue
                     try:
                         chunk = self._proc.read(4096)
                     except (EOFError, OSError, IOError):
@@ -312,12 +321,12 @@ class PtyBackend:
                     code = int(self._proc.wait(timeout=1))
             except Exception:
                 code = int(getattr(self._proc, "returncode", 0) or 0)
-            self._close_winpty_transport()
             self._closed = True
             try:
                 self.on_exit(code)
             except Exception:
                 pass
+            self._close_winpty_transport()
 
     def _emit_output(self, data: bytes) -> None:
         """Remove private cwd/startup markers before bytes reach clients."""
@@ -399,8 +408,8 @@ class PtyBackend:
         if not data:
             return
         with self._lock:
-            if self._closed:
-                raise RuntimeError("session_ended")
+            if self._closed or not self.is_alive():
+                raise EOFError("session_ended")
             if self._using_winpty:
                 value = data.decode("utf-8", "replace")
                 self._proc.write(value)

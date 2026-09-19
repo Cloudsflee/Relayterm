@@ -183,7 +183,15 @@ public final class MainActivity extends Activity {
         @Override
         public void onEvent(String profileId, JSONObject event) {
             String type = event.optString("type", "");
-            if ("resync_required".equals(type)) {
+            if ("error".equals(type) && event.optBoolean("fatal", false)) {
+                readyProfiles.remove(profileId);
+                requestedProfiles.remove(profileId);
+                pendingReplayProfiles.remove(profileId);
+                if (isSelected(profileId)) {
+                    sendButton.setEnabled(false);
+                    stopButton.setEnabled(false);
+                }
+            } else if ("resync_required".equals(type)) {
                 pendingReplayProfiles.remove(profileId);
                 terminalFor(profileId).reset();
                 if (isSelected(profileId)) setStatus("需要重新同步", WARNING);

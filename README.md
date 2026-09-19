@@ -81,6 +81,10 @@ Codex 模式懒启动 `codex app-server --stdio`，通过官方 `thread/list` �
 仓库的其他目录必须由用户明确选择。没有候选时通过 `thread/start` 创建 UUID。锁定 UUID
 失效或归档时保持绑定并提示重选；CLI 恢复错误保留绑定、显示原始终端输出且不自动 fork。
 
+新建会话显式使用 `historyMode=legacy`，通过 `thread/name/set` 保存标题，再读取空历史
+确认 rollout 已落盘并释放目录进程的写锁，之后才执行 `codex resume <UUID>`。
+恢复前刷新目录并验证目标 UUID；启动失败或 PTY 已关闭时只报告一次错误并停止输入/重连。
+
 ## 手机同步与配对
 
 Android 保留原有 manual profile；连接成功后从 `/v1/profiles` 和 `/v1/sessions` 缓存 PC

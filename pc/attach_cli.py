@@ -227,6 +227,12 @@ def build_open_message(
     return value
 
 
+def is_terminal_error(event: dict[str, object], ready: bool) -> bool:
+    return bool(event.get("fatal")) or not ready or str(event.get("code", "")) in (
+        "codex_launch_failed", "session_ended", "Pty is closed", "attachment_inactive",
+    )
+
+
 def run(
     profile_id: str,
     fresh: bool = False,
@@ -252,6 +258,7 @@ def run(
     stop = threading.Event()
     terminal_close_sent = threading.Event()
     shell_exited = threading.Event()
+    ready = threading.Event()
     exit_code = [0]
 
     def notify_terminal_closed() -> bool:
@@ -275,6 +282,7 @@ def run(
                 event = json.loads(value)
                 kind = event.get("type", "")
                 if kind == "ready":
+                    ready.set()
                     role = event.get("role", "observer")
                     ctypes.windll.kernel32.SetConsoleTitleW(f"RelayTerm - {profile_id} [{role}]")
                 elif kind == "control_changed":
@@ -286,6 +294,10 @@ def run(
                     break
                 elif kind == "error":
                     sys.stderr.write(f"\r\nRelayTerm: {event.get('message', event.get('code', 'error'))}\r\n")
+                    if is_terminal_error(event, ready.is_set()):
+                        ready.clear()
+                        exit_code[0] = 1
+                        break
         except Exception:
             pass
         finally:
@@ -307,7 +319,8 @@ def run(
                 value = read_key()
                 if value is None or value == b"":
                     continue
-                send_input_batch(stream, value)
+                if ready.is_set() and not stop.is_set():
+                    send_input_batch(stream, value)
     except (KeyboardInterrupt, OSError, websocket.WebSocketException):
         pass
     finally:

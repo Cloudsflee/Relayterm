@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import unittest
+from io import StringIO
 from unittest.mock import Mock, patch
 
 from pc.attach_cli import (
@@ -10,14 +11,49 @@ from pc.attach_cli import (
     SPECIAL_KEYS,
     build_open_message,
     connect_stream,
+    is_terminal_error,
     read_key,
     send_input_batch,
     send_terminal_closed,
     start_heartbeat,
+    run,
 )
 
 
 class AttachCliTest(unittest.TestCase):
+    def test_closed_pty_stops_receive_and_input_after_one_error(self):
+        stream = Mock()
+        stream.recv.side_effect = [
+            json.dumps({"type": "ready"}),
+            json.dumps({"type": "error", "code": "Pty is closed", "message": "Pty is closed"}),
+            AssertionError("must stop receiving after fatal error"),
+        ]
+        output = StringIO()
+        with (
+            patch("pc.attach_cli.SettingsStore"),
+            patch("pc.attach_cli.TokenStore"),
+            patch("pc.attach_cli.connect_stream", return_value=stream),
+            patch("pc.attach_cli.terminal_size", return_value=(120, 30)),
+            patch("pc.attach_cli.client_id", return_value="desktop"),
+            patch("pc.attach_cli.install_console_close_handler"),
+            patch("pc.attach_cli.ConsoleMode"),
+            patch("pc.attach_cli.start_heartbeat"),
+            patch("pc.attach_cli.ctypes.windll.kernel32.SetConsoleTitleW"),
+            patch("pc.attach_cli.read_key", return_value=None),
+            patch("pc.attach_cli.sys.stderr", output),
+        ):
+            self.assertEqual(1, run("profile", host_override="127.0.0.1", port_override=1234))
+        self.assertEqual(2, stream.recv.call_count)
+        self.assertEqual(1, output.getvalue().count("Pty is closed"))
+        stream.send_binary.assert_not_called()
+        stream.close.assert_called_once()
+
+    def test_open_errors_are_terminal_but_invalid_input_does_not_end_live_session(self):
+        error = {"type": "error", "code": "codex_thread_unavailable"}
+        self.assertTrue(is_terminal_error(error, False))
+        self.assertTrue(is_terminal_error({"fatal": True}, True))
+        self.assertFalse(is_terminal_error({"code": "signal_invalid"}, True))
+
     def test_handshake_timeout_is_cleared_for_idle_session(self):
         stream = Mock()
         with patch("pc.attach_cli.websocket.create_connection", return_value=stream) as create:

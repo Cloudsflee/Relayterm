@@ -19,7 +19,7 @@ from pathlib import Path
 
 from .config import SettingsStore, TokenStore, atomic_write, data_directory
 
-BRIDGE_GENERATION = "codex-color-v2"
+BRIDGE_GENERATION = "codex-resume-v3"
 DRAIN_STATE_VERSION = 1
 SHADOW_PROFILE_NAME = "profiles.v3.json"
 PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")

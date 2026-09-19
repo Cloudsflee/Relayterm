@@ -12,7 +12,7 @@ import time
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from bridge import relay_bridge
 from bridge.profile_catalog import Profile, ProfileStore
@@ -107,6 +107,31 @@ def close_stream(stream: socket.socket) -> None:
 
 
 class PtyProtocolTest(unittest.TestCase):
+    def test_failed_codex_delivers_original_output_and_one_terminal_exit(self) -> None:
+        sid = "codex-exit-test"
+        stream = self.connect(sid)
+        try:
+            send_frame(stream, 1, json.dumps({"type": "open", "sessionId": sid}).encode())
+            read_frame(stream)  # ready
+            read_frame(stream)  # boot
+            session = relay_bridge.SESSION_MANAGER.get(sid)
+            session.codex_thread_id = "019c5a2f-87f6-7db0-babc-2bb3923347a3"
+            original = b"ERROR: No saved session found with ID fixture\r\n"
+            session.on_output(original)
+            session.on_exit(7)
+            self.assertEqual((2, original), read_frame(stream))
+            error = json.loads(read_frame(stream)[1])
+            self.assertEqual("codex_launch_failed", error["code"])
+            self.assertTrue(error["fatal"])
+            self.assertEqual(7, json.loads(read_frame(stream)[1])["code"])
+            for _ in range(10):
+                send_frame(stream, 2, b"late terminal reply")
+            send_frame(stream, 1, b'{"type":"ping"}')
+            self.assertEqual("pong", json.loads(read_frame(stream)[1])["type"])
+        finally:
+            close_stream(stream)
+            relay_bridge.SESSION_MANAGER.remove(sid)
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.old_token = relay_bridge.TOKEN
@@ -304,6 +329,47 @@ class PtyProtocolTest(unittest.TestCase):
     "Windows pywinpty is required for the native PTY smoke test",
 )
 class WindowsPtyBackendTest(unittest.TestCase):
+    def test_child_exit_is_detected_when_winpty_socket_stays_open(self) -> None:
+        server, peer = socket.socketpair()
+        backend = PtyBackend.__new__(PtyBackend)
+        backend._closed = False
+        backend._using_winpty = True
+        backend._proc = Mock(fileobj=server, exitstatus=7)
+        backend._proc.isalive.return_value = False
+        backend._output_pending = bytearray()
+        backend._close_winpty_transport = Mock()
+        backend.on_exit = Mock()
+        try:
+            backend._read_loop()
+            backend.on_exit.assert_called_once_with(7)
+            backend._proc.read.assert_not_called()
+            self.assertTrue(backend._closed)
+        finally:
+            server.close()
+            peer.close()
+
+    def test_codex_startup_failure_reports_raw_error_and_exits_without_input(self) -> None:
+        from bridge.codex_sessions import build_codex_resume_command
+        with tempfile.TemporaryDirectory(prefix="relayterm-failed-resume-") as directory:
+            stub = Path(directory) / "codex-fixture.cmd"
+            stub.write_text('@echo off\necho ERROR: No saved session found with ID fixture\nexit /b 7\n')
+            command, marker = build_codex_resume_command(
+                "pwsh", "019c5a2f-87f6-7db0-babc-2bb3923347a3", [], executable=str(stub),
+            )
+            output = bytearray()
+            exited = threading.Event()
+            codes = []
+            backend = PtyBackend(
+                PtyLaunchSpec.profile("pwsh", directory, command, failure_marker=marker),
+                directory, 120, 36, output.extend, lambda code: (codes.append(code), exited.set()),
+            )
+            try:
+                self.assertTrue(exited.wait(8), "exit must arrive without keyboard input")
+                self.assertIn(b"ERROR: No saved session found with ID fixture", output)
+                self.assertEqual([7], codes)
+            finally:
+                backend.close()
+
     @unittest.skipUnless(os.name == "nt", "Windows terminal environment")
     def test_profile_pty_enables_truecolor_and_pwsh_ansi_rendering(self) -> None:
         with patch.dict(os.environ, {

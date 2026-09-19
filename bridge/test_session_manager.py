@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest.mock import Mock
 
 from bridge.pty_backend import PtyLaunchSpec
 from bridge.session_manager import SessionManager, replay_snapshot, sanitize_desktop_replay
@@ -53,6 +54,20 @@ class SessionManagerMultiAttachmentTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.manager.shutdown()
         self.directory.cleanup()
+
+    def test_dead_pty_emits_exit_once_and_discards_late_input(self) -> None:
+        attachment, _, events, _ = self.attach("desktop", "desktop")
+        self.session.codex_thread_id = "019c5a2f-87f6-7db0-babc-2bb3923347a3"
+        self.session.backend.write = Mock(side_effect=EOFError("Pty is closed"))
+        self.session.write_from(attachment, b"x")
+        for _ in range(10):
+            self.session.write_from(attachment, b"late input")
+            self.session.signal_from(attachment, "INT")
+        self.session.on_exit(1)  # Delayed reader notification must be idempotent.
+        self.session.backend.write.assert_called_once_with(b"x")
+        self.assertTrue(self.session.ended)
+        self.assertEqual(["error", "exit"], [e["type"] for e in events])
+        self.assertTrue(events[0]["fatal"])
 
     def attach(self, client_id, client_type, cols=100, rows=30, binary_result=True):
         output, events, closed = [], [], []

@@ -13,6 +13,18 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 public final class TerminalProfileTest {
+    @Test
+    public void failedOpenAndClosedPtyStopRetryButInputValidationKeepsSession() throws Exception {
+        assertTrue(PtyClient.isTerminalError(
+                new JSONObject().put("code", "codex_thread_unavailable"), false));
+        assertTrue(PtyClient.isTerminalError(
+                new JSONObject().put("code", "Pty is closed"), true));
+        assertTrue(PtyClient.isTerminalError(
+                new JSONObject().put("code", "codex_launch_failed").put("fatal", true), true));
+        assertFalse(PtyClient.isTerminalError(
+                new JSONObject().put("code", "signal_invalid"), true));
+    }
+
     private TerminalProfile profile(String id, boolean pinned, String opened) {
         return new TerminalProfile(id, id, "demo://local", "", "codex", "", "pwsh", pinned,
                 true, false, "", "", opened);

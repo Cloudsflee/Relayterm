@@ -336,6 +336,7 @@ class CodexAppServerClient:
         try:
             result = self._raw_request_locked("initialize", {
                 "clientInfo": {"name": "relayterm", "title": "RelayTerm", "version": "0.3.0"},
+                "capabilities": {"experimentalApi": True},
             })
             if not isinstance(result, dict):
                 raise AppServerProtocolError("initialize result invalid")
@@ -355,7 +356,10 @@ class CodexAppServerClient:
         self, method: str, params: dict[str, object] | None = None, *, timeout: float | None = None,
     ) -> object:
         last_error: CodexSessionError | None = None
-        for attempt in range(2):
+        # A timed-out create may already have allocated a thread. Replaying it
+        # would allocate another UUID, so only read operations are retried.
+        attempts = 2 if method in ("thread/list", "thread/read") else 1
+        for attempt in range(attempts):
             with self._call_lock:
                 try:
                     self._ensure_started_locked()
@@ -414,12 +418,33 @@ class CodexAppServerClient:
         return result
 
     def start_thread(self, cwd: str) -> dict[str, object]:
-        result = self.request("thread/start", {"cwd": os.path.abspath(cwd)})
+        # Keep creation atomic with respect to catalog requests. Closing the
+        # directory process releases the writer immediately; unsubscribe alone
+        # leaves a grace period during which CLI resume can hit the writer lock.
+        with self._call_lock:
+            try:
+                return self._start_saved_thread(cwd)
+            finally:
+                self._cache.clear()
+                self._stop_locked()
+
+    def _start_saved_thread(self, cwd: str) -> dict[str, object]:
+        result = self.request("thread/start", {
+            "cwd": os.path.abspath(cwd), "ephemeral": False, "historyMode": "legacy",
+        })
         if not isinstance(result, dict) or not isinstance(result.get("thread"), dict):
             raise AppServerProtocolError("thread/start result invalid")
         thread = dict(result["thread"])
         thread_id = canonical_thread_id(thread.get("id"))
         thread["id"] = thread_id
+        # thread/start defers writing an empty rollout. Naming the thread is a
+        # public operation that materializes it without adding a user/model turn.
+        # Do this before releasing the subscription or returning the UUID to CLI.
+        title = "RelayTerm · " + (Path(cwd).name or "新会话")
+        self.request("thread/name/set", {"threadId": thread_id, "name": title[:THREAD_TITLE_LENGTH]})
+        # Only this brand-new, empty thread needs a full read to prove that a
+        # real rollout exists. Existing history stays out of the catalog.
+        thread = self.read_thread(thread_id, include_turns=True)
         try:
             self.request("thread/unsubscribe", {"threadId": thread_id})
         except CodexSessionError:
@@ -429,6 +454,27 @@ class CodexAppServerClient:
         with self._state_lock:
             self._cache.clear()
         return thread
+
+    def read_thread(self, thread_id: str, *, include_turns: bool = False) -> dict[str, object]:
+        canonical = canonical_thread_id(thread_id)
+        try:
+            result = self.request("thread/read", {"threadId": canonical, "includeTurns": include_turns})
+        except AppServerRpcError as exc:
+            message = exc.message.casefold()
+            if any(part in message for part in (
+                "thread not loaded", "thread not found", "no saved session", "no rollout found",
+            )):
+                raise CodexSessionError(
+                    "codex_thread_unavailable", "该 Codex 会话未保存或已删除，请重新选择或新建会话。",
+                    status=409, details={"threadId": canonical},
+                ) from exc
+            raise
+        if not isinstance(result, dict) or not isinstance(result.get("thread"), dict):
+            raise AppServerProtocolError("thread/read result invalid")
+        thread = result["thread"]
+        if canonical_thread_id(thread.get("id")) != canonical or not _eligible_thread(thread):
+            raise CodexSessionError("codex_thread_unavailable", status=409, details={"threadId": canonical})
+        return dict(thread)
 
     def _stop_locked(self) -> None:
         with self._state_lock:
@@ -669,9 +715,9 @@ class CodexSessionService:
             _status_name(thread), timestamp_number(recency if recency is not None else updated),
         )
 
-    def discover(self, profile: Any) -> tuple[list[CodexCandidate], list[CodexCandidate]]:
+    def discover(self, profile: Any, *, force: bool = False) -> tuple[list[CodexCandidate], list[CodexCandidate]]:
         profile_path = normalize_working_directory(profile.working_directory)
-        threads = [value for value in self.client.list_threads(False) if _eligible_thread(value)]
+        threads = [value for value in self.client.list_threads(False, force=force) if _eligible_thread(value)]
         exact: list[CodexCandidate] = []
         remainder: list[dict[str, object]] = []
         for thread in threads:
@@ -760,13 +806,14 @@ class CodexSessionService:
             binding = self.bindings.set_auto(profile.id)
         elif mode == "locked":
             thread_id = canonical_thread_id(value.get("threadId"))
-            exact, repository = self.discover(profile)
+            exact, repository = self.discover(profile, force=True)
             status, candidate = self._locked_status(thread_id, exact, repository)
             if status != "valid" or candidate is None:
                 raise CodexSessionError(
                     "codex_binding_invalid", f"locked thread is {status}", status=409,
                     details={"threadId": thread_id, "bindingStatus": status},
                 )
+            self.client.read_thread(thread_id)
             binding = self.bindings.set_locked(profile.id, thread_id)
         else:
             raise CodexSessionError("codex_binding_mode_invalid", status=400)
@@ -791,7 +838,7 @@ class CodexSessionService:
                 )
             return current
 
-        exact, repository = self.discover(profile)
+        exact, repository = self.discover(profile, force=True)
         if requested:
             if self._find([*exact, *repository], requested) is None:
                 status, _candidate = self._locked_status(requested, exact, repository)
@@ -799,6 +846,7 @@ class CodexSessionService:
                     "codex_thread_unavailable", f"requested thread is {status}", status=409,
                     details={"threadId": requested, "threadStatus": status},
                 )
+            self.client.read_thread(requested)
             return requested
 
         binding = self.bindings.get(profile.id)
@@ -810,8 +858,10 @@ class CodexSessionService:
                     "codex_binding_invalid", f"locked thread is {status}", status=409,
                     details={"threadId": thread_id, "bindingStatus": status},
                 )
+            self.client.read_thread(candidate.id)
             return candidate.id
         if exact:
+            self.client.read_thread(exact[0].id)
             return exact[0].id
         if repository:
             raise CodexSessionError(

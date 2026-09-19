@@ -110,6 +110,21 @@ An already running RelayTerm PTY always wins an ordinary open. Explicitly openin
 a different UUID returns `codex_thread_conflict`; PC and Android confirmation
 flows then remove the old PTY and reconnect with that UUID.
 
+New threads request the experimental `historyMode=legacy` contract explicitly:
+the local CLI's default paginated thread may expose metadata without a resumable
+rollout. `thread/name/set` materializes the named empty legacy history; a full
+read of this new thread verifies it without adding a prompt or model turn. The
+catalog process then closes to release its writer lock before CLI resume (an
+unsubscribe alone leaves a grace period). Subsequent queries restart it lazily.
+Existing threads use a fresh listing and a metadata-only read before launch.
+Create requests are never replayed after timeout because they may have allocated
+a UUID even if the response was lost.
+
+The Windows PTY reader polls child liveness while waiting on pywinpty's socket.
+Exit notifications are idempotent and late input is discarded. CLI startup
+failures carry `fatal=true`; desktop and Android clients stop input and automatic
+reconnection while retaining the original terminal output and binding.
+
 The resume command is generated as argv-equivalent quoted PowerShell or cmd text
 from the validated UUID and `codexArgs`; `--last` is not used. A nonzero resume
 exit emits `codex_launch_failed` and closes the shell after streaming the native

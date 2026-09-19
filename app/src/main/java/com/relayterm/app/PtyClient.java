@@ -178,8 +178,17 @@ public final class PtyClient {
                         String cwd = event.optString("cwd", "");
                         post(operation, () -> callback.onExit(selected.id, code, cwd));
                     } else if ("error".equals(type)) {
+                        if (isTerminalError(event, connected)) {
+                            connected = false;
+                            sessionEnded = true;
+                            event.put("fatal", true);
+                            webSocket.close(1000, "terminal_error");
+                        }
                         String value = event.optString("message", event.optString("code", "PTY 错误"));
-                        post(operation, () -> callback.onError(selected.id, value));
+                        post(operation, () -> {
+                            callback.onEvent(selected.id, event);
+                            callback.onError(selected.id, value);
+                        });
                     } else if ("resync_required".equals(type)) {
                         post(operation, () -> callback.onEvent(selected.id, event));
                         connected = false;
@@ -245,9 +254,16 @@ public final class PtyClient {
         return open;
     }
 
+    static boolean isTerminalError(JSONObject event, boolean ready) {
+        String code = event.optString("code", "");
+        return !ready || event.optBoolean("fatal", false)
+                || "codex_launch_failed".equals(code) || "session_ended".equals(code)
+                || "Pty is closed".equals(code) || "attachment_inactive".equals(code);
+    }
+
     private synchronized void handleFailure(
             long operation, TerminalProfile selected, Listener callback, String detail) {
-        if (!isCurrent(operation) || manualClose) return;
+        if (!isCurrent(operation) || manualClose || sessionEnded) return;
         if (reconnectScheduledFor == operation) return;
         post(operation, () -> callback.onError(selected.id, detail));
         scheduleReconnect(operation, selected, callback);
@@ -297,6 +313,7 @@ public final class PtyClient {
     }
 
     public void sendInput(byte[] bytes) {
+        if (sessionEnded) return;
         if (bytes == null || bytes.length == 0) return;
         if (bytes.length > MAX_FRAME) throw new IllegalArgumentException("输入帧超过 64 KiB");
         WebSocket active = socket;
@@ -382,6 +399,7 @@ public final class PtyClient {
     }
 
     private void sendControl(JSONObject event) {
+        if (sessionEnded) return;
         WebSocket active = socket;
         if (active != null && !active.send(event.toString())) notifyWriteError("发送失败");
     }

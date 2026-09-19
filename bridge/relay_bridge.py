@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import hmac
 import html
@@ -66,7 +67,7 @@ TOKEN = os.environ.get("RELAYTERM_TOKEN", "")
 MAX_SESSIONS = int(os.environ.get("RELAYTERM_MAX_SESSIONS", "16"))
 IDLE_SECONDS = int(os.environ.get("RELAYTERM_IDLE_SECONDS", "1800"))
 TIMEOUT_SECONDS = 30
-BRIDGE_GENERATION = os.environ.get("RELAYTERM_BRIDGE_GENERATION", "codex-color-v2")
+BRIDGE_GENERATION = os.environ.get("RELAYTERM_BRIDGE_GENERATION", "codex-resume-v3")
 DRAIN_STATE_PATH = os.environ.get("RELAYTERM_DRAIN_STATE_PATH", "")
 try:
     DESKTOP_TIMEOUT_SECONDS = max(
@@ -856,6 +857,32 @@ class RelayHandler(BaseHTTPRequestHandler):
                 pass
 
 
+class RelayHTTPServer(ThreadingHTTPServer):
+    """Bounded request workers so long-running bridges cannot exhaust threads."""
+
+    request_queue_size = 128
+
+    def __init__(self, server_address, handler_class, *, max_workers: int = 16):
+        super().__init__(server_address, handler_class)
+        self.daemon_threads = True
+        self._request_executor = ThreadPoolExecutor(
+            max_workers=max(2, int(max_workers)),
+            thread_name_prefix="relayterm-http",
+        )
+
+    def process_request(self, request, client_address):  # noqa: N802
+        try:
+            self._request_executor.submit(
+                self.process_request_thread, request, client_address,
+            )
+        except (RuntimeError, MemoryError):
+            self.shutdown_request(request)
+
+    def server_close(self):  # noqa: N802
+        self._request_executor.shutdown(wait=False, cancel_futures=True)
+        super().server_close()
+
+
 def create_app(manager: SessionManager | None = None, token: str | None = None):
     """Build an aiohttp adapter with the same routes as the stdlib server."""
     try:
@@ -1182,8 +1209,7 @@ def create_app(manager: SessionManager | None = None, token: str | None = None):
 
 def main() -> None:
     print(f"RelayTerm bridge listening on http://{HOST}:{PORT}", flush=True)
-    server = ThreadingHTTPServer((HOST, PORT), RelayHandler)
-    server.daemon_threads = True
+    server = RelayHTTPServer((HOST, PORT), RelayHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
