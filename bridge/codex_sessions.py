@@ -904,7 +904,13 @@ def build_codex_resume_command(
 ) -> tuple[str, str]:
     """Build a shell command whose only session selector is a verified UUID."""
     canonical = canonical_thread_id(thread_id)
-    argv = [str(executable), "resume", canonical, *[str(value) for value in codex_args]]
+    # RelayTerm clients can run under an elevated desktop host, while Codex's
+    # shared daemon must be started from a non-elevated terminal.  Always keep
+    # this PTY invocation self-contained so it never attempts the daemon path.
+    args = [str(value) for value in codex_args]
+    if "--no-daemon" not in args:
+        args.insert(0, "--no-daemon")
+    argv = [str(executable), "resume", canonical, *args]
     marker = "__RELAYTERM_CODEX_FAILED_" + uuid.uuid4().hex + "__"
     shell = str(shell).strip().lower()
     if shell in ("pwsh", "powershell"):

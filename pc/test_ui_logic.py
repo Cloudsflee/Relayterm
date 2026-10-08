@@ -3,8 +3,10 @@ from __future__ import annotations
 import datetime as dt
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from queue import SimpleQueue
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -32,6 +34,27 @@ class UiLogicTest(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_worker_ui_callback_is_queued_for_the_main_thread(self):
+        agent = Agent.__new__(Agent)
+        main_thread = threading.get_ident()
+        agent._ui_thread_id = main_thread
+        agent._ui_callbacks = SimpleQueue()
+        agent._closing = False
+        agent.root = Mock()
+        agent.logger = Mock()
+        received = []
+
+        worker = threading.Thread(
+            target=lambda: agent._post_ui(lambda: received.append(threading.get_ident())),
+        )
+        worker.start()
+        worker.join(timeout=1)
+
+        self.assertEqual([], received)
+        agent._drain_ui_callbacks()
+        self.assertEqual([main_thread], received)
+        agent.root.after.assert_called_once_with(50, agent._drain_ui_callbacks)
 
     def test_activity_formats_relative_and_calendar_times(self):
         self.assertEqual("刚刚", format_activity("2026-08-11T14:31:45+00:00", self.now))

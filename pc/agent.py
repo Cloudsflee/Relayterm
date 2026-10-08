@@ -19,6 +19,7 @@ import uuid
 from collections.abc import Callable
 from ctypes import wintypes
 from pathlib import Path
+from queue import Empty, SimpleQueue
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import quote, urlsplit
 
@@ -40,6 +41,19 @@ if __package__ in (None, ""):
         sort_profiles_by_recent,
         unpin_profile,
     )
+    from pc.drain_switch import (
+        BRIDGE_GENERATION,
+        SHADOW_PROFILE_NAME,
+        DrainStateStore,
+        find_available_port,
+        merge_session_snapshots,
+        port_is_free,
+        prepare_shadow_catalog,
+        probe_bridge,
+        process_parent_id,
+        terminate_drained_bridge,
+        terminate_legacy_agent,
+    )
     from pc.runtime import (
         HotKeyListener,
         SingleInstance,
@@ -51,19 +65,6 @@ if __package__ in (None, ""):
     )
     from pc.tunnel import QuickTunnel
     from pc.ui_theme import Tooltip, apply_theme, enable_dpi_awareness, glyph, icon_font
-    from pc.drain_switch import (
-        BRIDGE_GENERATION,
-        DrainStateStore,
-        SHADOW_PROFILE_NAME,
-        find_available_port,
-        merge_session_snapshots,
-        port_is_free,
-        prepare_shadow_catalog,
-        probe_bridge,
-        process_parent_id,
-        terminate_drained_bridge,
-        terminate_legacy_agent,
-    )
 else:
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
     from .config import (
@@ -78,6 +79,19 @@ else:
         sort_profiles_by_recent,
         unpin_profile,
     )
+    from .drain_switch import (
+        BRIDGE_GENERATION,
+        SHADOW_PROFILE_NAME,
+        DrainStateStore,
+        find_available_port,
+        merge_session_snapshots,
+        port_is_free,
+        prepare_shadow_catalog,
+        probe_bridge,
+        process_parent_id,
+        terminate_drained_bridge,
+        terminate_legacy_agent,
+    )
     from .runtime import (
         HotKeyListener,
         SingleInstance,
@@ -89,19 +103,6 @@ else:
     )
     from .tunnel import QuickTunnel
     from .ui_theme import Tooltip, apply_theme, enable_dpi_awareness, glyph, icon_font
-    from .drain_switch import (
-        BRIDGE_GENERATION,
-        DrainStateStore,
-        SHADOW_PROFILE_NAME,
-        find_available_port,
-        merge_session_snapshots,
-        port_is_free,
-        prepare_shadow_catalog,
-        probe_bridge,
-        process_parent_id,
-        terminate_drained_bridge,
-        terminate_legacy_agent,
-    )
 
 
 def format_activity(value: object, now: dt.datetime | None = None) -> str:
@@ -415,11 +416,18 @@ class Agent:
         promote_callback: Callable[[], bool] | None = None,
     ) -> None:
         self.root = root
+        # Tk marshals cross-thread calls by creating a native event handle for
+        # each call.  A long-running launcher must keep those calls on the Tk
+        # thread instead of invoking root.after from worker threads.
+        self._ui_thread_id = threading.get_ident()
+        self._ui_callbacks = SimpleQueue()
+        self._closing = False
         self.sidecar = bool(sidecar)
         self.promote_callback = promote_callback
         self._promotion_pending = False
         self._promote_after_start = False
         self.root.withdraw()
+        self.root.after(50, self._drain_ui_callbacks)
         self.root.title("RelayTerm 启动器")
         self.settings_store = SettingsStore()
         self.settings = self.settings_store.load()
@@ -480,7 +488,7 @@ class Agent:
         except tk.TclError:
             pass
         self.hotkey = HotKeyListener(
-            lambda: self.root.after(0, self.show_panel), "D" if self.sidecar else "R",
+            lambda: self._post_ui(self.show_panel), "D" if self.sidecar else "R",
         )
         self.hotkey.start()
         if self.sidecar and self._promote_after_start:
@@ -492,6 +500,33 @@ class Agent:
                 self.logger.error("startup registration failed: %s", exc)
         self.start_bridge()
         self.root.after(700, self.poll_status)
+
+    def _post_ui(self, callback: Callable[[], None]) -> None:
+        """Run a callback on Tk's thread without cross-thread Tcl calls."""
+        if self._closing:
+            return
+        if threading.get_ident() == self._ui_thread_id:
+            callback()
+            return
+        self._ui_callbacks.put(callback)
+
+    def _drain_ui_callbacks(self) -> None:
+        """Drain worker results from the Tk thread and keep the pump alive."""
+        if self._closing:
+            return
+        for _ in range(64):
+            try:
+                callback = self._ui_callbacks.get_nowait()
+            except Empty:
+                break
+            try:
+                callback()
+            except Exception:
+                self.logger.exception("UI callback failed")
+        try:
+            self.root.after(50, self._drain_ui_callbacks)
+        except tk.TclError:
+            self._closing = True
 
     def _ready_label(self) -> str:
         key = "D" if self.sidecar else "R"
@@ -506,7 +541,7 @@ class Agent:
             callback = self.promote_callback
             if callback is not None and callback():
                 self.hotkey.stop()
-                self.hotkey = HotKeyListener(lambda: self.root.after(0, self.show_panel), "R")
+                self.hotkey = HotKeyListener(lambda: self._post_ui(self.show_panel), "R")
                 self.hotkey.start()
                 self.sidecar = False
                 self.settings["host"], self.settings["port"] = self.host, self.port
@@ -805,7 +840,7 @@ class Agent:
             self.logger.info("bridge: %s", line.rstrip())
         code = process.wait()
         if self.bridge is process:
-            self.root.after(0, lambda: self._set_bridge_error(f"Bridge 已退出 ({code})"))
+            self._post_ui(lambda: self._set_bridge_error(f"Bridge 已退出 ({code})"))
 
     def _wait_for_bridge(self) -> None:
         deadline = time.monotonic() + 8
@@ -813,11 +848,11 @@ class Agent:
             try:
                 status, value = self.api("/health", authenticated=False, timeout=1)
                 if status == 200 and value.get("ok") is True and value.get("service") == "relayterm":
-                    self.root.after(0, self._bridge_ready)
+                    self._post_ui(self._bridge_ready)
                     return
             except Exception:
                 time.sleep(0.15)
-        self.root.after(0, lambda: self._set_bridge_error("Bridge 健康检查超时"))
+        self._post_ui(lambda: self._set_bridge_error("Bridge 健康检查超时"))
 
     def _bridge_ready(self) -> None:
         self.bridge_state = "ready"
@@ -869,7 +904,7 @@ class Agent:
                     def complete() -> None:
                         self._merge_catalog_activity(value)
                         self.refresh_tree()
-                    self.root.after(0, complete)
+                    self._post_ui(complete)
             except Exception:
                 pass
 
@@ -1213,7 +1248,7 @@ class Agent:
                     if self.detail_profile_id == profile.id:
                         self._selection_changed()
 
-            self.root.after(0, complete)
+            self._post_ui(complete)
 
         threading.Thread(target=fetch, name="relayterm-codex-detail", daemon=True).start()
 
@@ -1745,7 +1780,7 @@ class Agent:
                 message = "项目已停止" if status == 200 else str(value.get("error", "项目未运行"))
             except Exception as exc:
                 message = str(exc)
-            self.root.after(0, lambda: self._show_transient_status(message))
+            self._post_ui(lambda: self._show_transient_status(message))
 
         threading.Thread(target=stop, daemon=True).start()
 
@@ -1808,7 +1843,7 @@ class Agent:
                                 "legacy launcher identity changed pid=%s", legacy_agent_pid,
                             )
                     if self.sidecar:
-                        self.root.after(0, self._request_sidecar_promotion)
+                        self._post_ui(self._request_sidecar_promotion)
                     continue
             drain_snapshots.append((base_url, values))
             updated_drains.append(entry)
@@ -1866,7 +1901,7 @@ class Agent:
             if changed:
                 self.refresh_tree()
 
-        self.root.after(0, complete)
+        self._post_ui(complete)
 
     def remote_access(self) -> None:
         if self.tunnel is not None and self.tunnel.running:
@@ -1896,7 +1931,7 @@ class Agent:
             messagebox.showerror("Quick Tunnel", str(exc), parent=self.panel)
 
     def _tunnel_callback(self, tunnel: QuickTunnel, state: str, detail: str) -> None:
-        self.root.after(0, lambda: self._apply_tunnel_state(tunnel, state, detail))
+        self._post_ui(lambda: self._apply_tunnel_state(tunnel, state, detail))
 
     def _apply_tunnel_state(self, tunnel: QuickTunnel, state: str, detail: str) -> None:
         if tunnel is not self.tunnel:
@@ -1960,14 +1995,14 @@ class Agent:
                 self._close_pairing_dialog()
                 self.show_pairing()
 
-            self.root.after(0, complete)
+            self._post_ui(complete)
         except Exception as exc:
             message = f"配对码生成失败: {exc}"
             def failed() -> None:
                 self._pairing_fetching = False
                 if tunnel is self.tunnel:
                     self.tunnel_status_var.set(message)
-            self.root.after(0, failed)
+            self._post_ui(failed)
 
     def _close_pairing_dialog(self) -> None:
         dialog = self.pairing_dialog
@@ -2062,6 +2097,7 @@ class Agent:
         write_process_record(os.getpid(), self.bridge.pid if self.bridge else 0, 0)
 
     def close(self) -> None:
+        self._closing = True
         self.hotkey.stop()
         tunnel, self.tunnel = self.tunnel, None
         if tunnel is not None:

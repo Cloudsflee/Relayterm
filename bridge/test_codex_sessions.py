@@ -312,6 +312,8 @@ class SessionServiceTest(unittest.TestCase):
         self.assertIn("'x y'", power)
         self.assertIn('"' + THREAD_A + '"', cmd)
         self.assertNotIn("--last", power + cmd)
+        self.assertIn("--no-daemon", power)
+        self.assertIn("--no-daemon", cmd)
         self.assertIn(marker, power)
         self.assertIn(cmd_marker, cmd)
 

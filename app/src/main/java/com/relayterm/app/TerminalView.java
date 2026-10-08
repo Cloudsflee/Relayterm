@@ -12,6 +12,7 @@ import android.util.AttributeSet;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
@@ -41,6 +42,9 @@ public final class TerminalView extends View {
     private int lastColumns = 100;
     private int lastRows = 32;
     private int scrollOffset;
+    private float touchLastY;
+    private float touchScrollRemainder;
+    private boolean touchScrolling;
     private boolean resizeSuspended;
     private int pendingColumns = -1;
     private int pendingRows = -1;
@@ -252,27 +256,51 @@ public final class TerminalView extends View {
 
     @Override
     public boolean onTouchEvent(MotionEvent event) {
-        if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+        switch (event.getActionMasked()) {
+        case MotionEvent.ACTION_DOWN:
             requestFocus();
-            scrollToBottom();
-            // A terminal is an editor as well as a canvas. Requesting the IME
-            // here lets an observer type directly without using the command
-            // bar, while the bridge still decides whether input takes control.
-            post(() -> {
-                InputMethodManager manager = (InputMethodManager)
-                        getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
-                if (manager != null) {
-                    manager.restartInput(this);
-                    manager.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT);
-                }
-            });
+            touchLastY = event.getY();
+            touchScrollRemainder = 0f;
+            touchScrolling = false;
             return true;
-        }
-        if (event.getActionMasked() == MotionEvent.ACTION_UP) {
+        case MotionEvent.ACTION_MOVE:
+            float delta = event.getY() - touchLastY;
+            touchLastY = event.getY();
+            touchScrollRemainder += delta;
+            if (!touchScrolling && Math.abs(touchScrollRemainder)
+                    >= ViewConfiguration.get(getContext()).getScaledTouchSlop()) {
+                touchScrolling = true;
+            }
+            if (touchScrolling && cellHeight > 0f) {
+                int rows = (int) (touchScrollRemainder / cellHeight);
+                if (rows != 0) {
+                    int maximum = model.scrollbackSnapshot().size();
+                    scrollOffset = Math.max(0, Math.min(maximum, scrollOffset + rows));
+                    touchScrollRemainder -= rows * cellHeight;
+                    invalidate();
+                }
+            }
+            return true;
+        case MotionEvent.ACTION_UP:
+            if (!touchScrolling) {
+                // A tap keeps the terminal editable and brings up the IME.
+                post(() -> {
+                    InputMethodManager manager = (InputMethodManager)
+                            getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+                    if (manager != null) {
+                        manager.restartInput(this);
+                        manager.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT);
+                    }
+                });
+            }
             performClick();
             return true;
+        case MotionEvent.ACTION_CANCEL:
+            touchScrolling = false;
+            return true;
+        default:
+            return super.onTouchEvent(event);
         }
-        return super.onTouchEvent(event);
     }
 
     @Override
